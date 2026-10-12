@@ -1,0 +1,35 @@
+<ResourceDictionary
+    x:Class="Bortle.NinaPlugin.Options"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- NINA finds a plugin's settings page by the key "<plugin name>_Options";
+         the DataContext is the BortlePlugin instance. -->
+    <DataTemplate x:Key="Bortle_Options">
+        <StackPanel Margin="5" Orientation="Vertical">
+            <TextBlock Margin="0,0,0,10" TextWrapping="Wrap"
+                       Text="Überträgt jedes Bild, das NINA speichert, an Bortle. Am Ende der Sequenz entwickelt Bortle alle Nächte des Ziels zusammen – mit der Stufe, die du beim Planen gewählt hast. Den Plugin-Schlüssel erzeugst du in Bortle unter Profil → NINA-Plugin." />
+
+            <StackPanel Margin="0,5" Orientation="Horizontal">
+                <TextBlock Width="160" VerticalAlignment="Center" Text="Bortle-Adresse" />
+                <TextBox Width="320" Text="{Binding ServerUrl, UpdateSourceTrigger=LostFocus}" />
+            </StackPanel>
+            <StackPanel Margin="0,5" Orientation="Horizontal">
+                <TextBlock Width="160" VerticalAlignment="Center" Text="Plugin-Schlüssel" />
+                <TextBox Width="320" Text="{Binding PluginKey, UpdateSourceTrigger=LostFocus}" />
+            </StackPanel>
+            <StackPanel Margin="0,5" Orientation="Horizontal">
+                <TextBlock Width="160" VerticalAlignment="Center" Text="Bilder übertragen" />
+                <CheckBox VerticalAlignment="Center" IsChecked="{Binding UploadEnabled}" />
+            </StackPanel>
+
+            <StackPanel Margin="0,10,0,5" Orientation="Horizontal">
+                <Button Width="160" Height="25" Command="{Binding TestConnectionCommand}" Content="Verbindung testen" />
+                <TextBlock Margin="10,0,0,0" VerticalAlignment="Center" TextWrapping="Wrap" Text="{Binding TestResult}" />
+            </StackPanel>
+
+            <TextBlock Margin="0,10,0,0" FontWeight="Bold" Text="Status" />
+            <TextBlock TextWrapping="Wrap" Text="{Binding StatusText}" />
+        </StackPanel>
+    </DataTemplate>
+</ResourceDictionary>

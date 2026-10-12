@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Everything the plugin does that is not NINA: the queue on disk, the
+       HTTP calls to Bortle, and the upload loop. Plain .NET, so it builds and
+       is tested on any OS; the NINA project around it is Windows-only. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Bortle.Capture</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Bortle.Capture.Core.Tests" />
+  </ItemGroup>
+
+</Project>

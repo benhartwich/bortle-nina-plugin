@@ -1,0 +1,35 @@
+<ResourceDictionary
+    x:Class="Bortle.NinaPlugin.Sequencer.Templates"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="clr-namespace:Bortle.NinaPlugin.Sequencer"
+    xmlns:mini="clr-namespace:NINA.View.Sequencer.MiniSequencer;assembly=NINA.Sequencer"
+    xmlns:nina="clr-namespace:NINA.View.Sequencer;assembly=NINA.Sequencer">
+
+    <DataTemplate DataType="{x:Type local:FinishBortleSession}">
+        <nina:SequenceBlockView DataContext="{Binding}">
+            <nina:SequenceBlockView.SequenceItemContent>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock VerticalAlignment="Center" Text="Auf Übertragung warten, höchstens" />
+                    <TextBox
+                        Width="50"
+                        Margin="5,0,5,0"
+                        Text="{Binding UploadTimeoutMinutes}"
+                        TextAlignment="Right" />
+                    <TextBlock VerticalAlignment="Center" Text="min" />
+                </StackPanel>
+            </nina:SequenceBlockView.SequenceItemContent>
+        </nina:SequenceBlockView>
+    </DataTemplate>
+
+    <DataTemplate x:Key="Bortle.NinaPlugin.Sequencer.FinishBortleSession_Mini">
+        <mini:MiniSequenceItem>
+            <mini:MiniSequenceItem.SequenceItemContent>
+                <TextBlock
+                    Margin="5,0,0,0"
+                    VerticalAlignment="Center"
+                    Text="{Binding UploadTimeoutMinutes, StringFormat='≤ {0} min'}" />
+            </mini:MiniSequenceItem.SequenceItemContent>
+        </mini:MiniSequenceItem>
+    </DataTemplate>
+</ResourceDictionary>
