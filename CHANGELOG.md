@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.0.1
+
+- The N.I.N.A. manifest names the maintainer as the author (was "Bortle").
+
 ## 0.1.0.0
 
 First version.

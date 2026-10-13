@@ -5,15 +5,16 @@ using System.Runtime.InteropServices;
 // plugin's settings under this GUID.
 [assembly: Guid("6f1c2b8e-4d0a-4e5b-9a63-2b7c0d9e5a41")]
 
-[assembly: AssemblyVersion("0.1.0.0")]
-[assembly: AssemblyFileVersion("0.1.0.0")]
+[assembly: AssemblyVersion("0.1.0.1")]
+[assembly: AssemblyFileVersion("0.1.0.1")]
 
 // [MANDATORY] The name NINA shows — and the name Bortle looks for in
 // /application/plugins before it puts "Finish Bortle session" into a sequence
 // (services/planner/nina_sequence.py, BORTLE_PLUGIN_NAME).
 [assembly: AssemblyTitle("Bortle")]
 [assembly: AssemblyDescription("Sends every frame NINA saves to your Bortle, which develops the night when the sequence ends.")]
-[assembly: AssemblyCompany("Bortle")]
+// N.I.N.A.'s manifest script takes the author from here: the accountable person.
+[assembly: AssemblyCompany("Benjamin Hartwich")]
 [assembly: AssemblyProduct("Bortle")]
 [assembly: AssemblyCopyright("Copyright © 2026 Benjamin Hartwich")]
 
