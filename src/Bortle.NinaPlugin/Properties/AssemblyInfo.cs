@@ -20,7 +20,8 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyMetadata("MinimumApplicationVersion", "3.2.0.9001")]
 [assembly: AssemblyMetadata("License", "AGPL-3.0")]
 [assembly: AssemblyMetadata("LicenseURL", "https://www.gnu.org/licenses/agpl-3.0.html")]
-[assembly: AssemblyMetadata("Repository", "https://github.com/benhartwich/bortle")]
+[assembly: AssemblyMetadata("Repository", "https://github.com/benhartwich/bortle-nina-plugin")]
+[assembly: AssemblyMetadata("ChangelogURL", "https://github.com/benhartwich/bortle-nina-plugin/blob/main/CHANGELOG.md")]
 [assembly: AssemblyMetadata("Homepage", "https://bortle.eu")]
 [assembly: AssemblyMetadata("Tags", "Bortle,Upload,Processing")]
 [assembly: AssemblyMetadata("LongDescription", @"Delivers your frames to Bortle (bortle.eu or your own install) while you image.
@@ -36,6 +37,10 @@ using System.Runtime.InteropServices;
 The plugin only delivers data. It controls no equipment and never delays or
 fails a sequence; safety stays with NINA.
 
-Create the plugin key in Bortle under Profil → NINA-Plugin.")]
+Create the plugin key in Bortle under Profil → NINA-Plugin.
+
+Open source under the AGPL-3.0. Written with substantial help from an AI model
+(Anthropic's Claude) and maintained by Benjamin Hartwich; see the repository's
+README for what that means.")]
 
 [assembly: ComVisible(false)]

@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # The core (queue, client, upload loop) is plain .NET and tested here; the
+    # N.I.N.A. project is net8.0-windows but compiles on Linux, XAML included.
+    name: Test and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "8.0.x"
+      - name: dotnet test (core)
+        run: dotnet test tests/Bortle.Capture.Core.Tests --filter "Category!=E2E"
+      - name: build + package
+        run: ./package.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bortle-nina-plugin
+          path: dist/*.zip
