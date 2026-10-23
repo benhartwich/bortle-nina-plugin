@@ -1,0 +1,94 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Same policy as Bortle's (github.com/benhartwich/bortle, renovate.json): the hosted Mend Renovate app, one grouped PR per ecosystem once a week in the Monday-night window, security fixes at any time, the owner assigned so GitHub actually notifies him.",
+    "The N.I.N.A. packages are held for approval on the Dependency Dashboard, whatever the update type: they decide the oldest N.I.N.A. the plugin runs on. Raising them means raising MinimumApplicationVersion in Properties/AssemblyInfo.cs and the manifest folder (manifests/b/Bortle/<nina version>/), and testing in that N.I.N.A. — never a merge on green CI alone."
+  ],
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard"
+  ],
+  "mode": "full",
+  "timezone": "Europe/Berlin",
+  "schedule": [
+    "* 0-5 * * 1"
+  ],
+  "prConcurrentLimit": 3,
+  "labels": [
+    "dependencies"
+  ],
+  "assignees": [
+    "benhartwich"
+  ],
+  "reviewers": [
+    "benhartwich"
+  ],
+  "semanticCommits": "disabled",
+  "commitMessageAction": "update",
+  "minimumReleaseAge": "5 days",
+  "packageRules": [
+    {
+      "description": "N.I.N.A. itself: one PR for all its packages, only after approval (see above)",
+      "matchManagers": [
+        "nuget"
+      ],
+      "matchPackageNames": [
+        "NINA.*"
+      ],
+      "groupName": "N.I.N.A. packages",
+      "dependencyDashboardApproval": true,
+      "labels": [
+        "dependencies",
+        "nina"
+      ]
+    },
+    {
+      "description": "The test stack (xunit, test SDK)",
+      "matchManagers": [
+        "nuget"
+      ],
+      "matchPackageNames": [
+        "!NINA.*"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "NuGet test dependencies"
+    },
+    {
+      "description": "The actions CI and the release workflow run on",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest"
+      ],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "description": "Majors stay single and wait for approval on the dashboard",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "dependencyDashboardApproval": true,
+      "labels": [
+        "dependencies",
+        "major"
+      ]
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "schedule": [
+      "at any time"
+    ],
+    "minimumReleaseAge": null,
+    "labels": [
+      "dependencies",
+      "security"
+    ]
+  },
+  "osvVulnerabilityAlerts": true
+}
