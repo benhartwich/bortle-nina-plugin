@@ -78,6 +78,13 @@
         "dependencies",
         "major"
       ]
+    },
+    {
+      "description": "N.I.N.A. 3.2 runs on .NET 8, and the plugin is built with the same .NET 8 SDK N.I.N.A. is (CI and the release workflow, actions/setup-dotnet). Lift together with N.I.N.A.'s own move to a newer runtime, not before.",
+      "matchPackageNames": [
+        "dotnet-sdk"
+      ],
+      "allowedVersions": "<9"
     }
   ],
   "vulnerabilityAlerts": {
