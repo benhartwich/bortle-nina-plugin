@@ -12,11 +12,14 @@
 
             <StackPanel Margin="0,5" Orientation="Horizontal">
                 <TextBlock Width="160" VerticalAlignment="Center" Text="Bortle-Adresse" />
-                <TextBox Width="320" Text="{Binding ServerUrl, UpdateSourceTrigger=LostFocus}" />
+                <TextBox Width="320" Text="{Binding ServerUrl, UpdateSourceTrigger=PropertyChanged}" />
             </StackPanel>
             <StackPanel Margin="0,5" Orientation="Horizontal">
                 <TextBlock Width="160" VerticalAlignment="Center" Text="Plugin-Schlüssel" />
-                <TextBox Width="320" Text="{Binding PluginKey, UpdateSourceTrigger=LostFocus}" />
+                <!-- saved on every change: a pasted key is in the profile even if
+                     NINA is closed or "Verbindung testen" is clicked before the
+                     field loses focus. The uploader waits until typing stops. -->
+                <TextBox Width="320" Text="{Binding PluginKey, UpdateSourceTrigger=PropertyChanged}" />
             </StackPanel>
             <StackPanel Margin="0,5" Orientation="Horizontal">
                 <TextBlock Width="160" VerticalAlignment="Center" Text="Bilder übertragen" />

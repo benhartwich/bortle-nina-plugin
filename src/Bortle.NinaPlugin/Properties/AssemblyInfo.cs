@@ -5,8 +5,8 @@ using System.Runtime.InteropServices;
 // plugin's settings under this GUID.
 [assembly: Guid("6f1c2b8e-4d0a-4e5b-9a63-2b7c0d9e5a41")]
 
-[assembly: AssemblyVersion("0.1.0.2")]
-[assembly: AssemblyFileVersion("0.1.0.2")]
+[assembly: AssemblyVersion("0.1.0.3")]
+[assembly: AssemblyFileVersion("0.1.0.3")]
 
 // [MANDATORY] The name NINA shows — and the name Bortle looks for in
 // /application/plugins before it puts "Finish Bortle session" into a sequence
