@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.0.2
+
+- *Finish Bortle session* (and NINA's own end of a sequence) waits until NINA
+  has saved the images it still had on its way before ending the session.
+  NINA writes the last image of a sequence in the background, after the
+  sequence moved on; on the first real test the session ended 13 s before its
+  only frame was written, and the frame opened a session of its own.
+- A frame saved up to 30 minutes after its session ended still goes to that
+  session instead of starting a new one.
+
 ## 0.1.0.1
 
 - The N.I.N.A. manifest names the maintainer as the author (was "Bortle").

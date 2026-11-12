@@ -267,6 +267,104 @@ public sealed class UploaderTests : IDisposable
         Assert.Equal(2, queue.Count); // the frame and the end, both still there
     }
 
+    [Fact]
+    public async Task Finishing_waits_for_the_image_NINA_is_still_saving()
+    {
+        // 2026-11-12: Finish ended the session at 20:42:51, NINA wrote the
+        // 5 s dark at 20:43:04, and the frame opened a session of its own.
+        var saves = new SaveTracker(() => _now);
+        var queue = new FrameQueue(_dir);
+        var uploader = new Uploader(
+            queue, new BortleClient(new HttpClient(_server), () => _settings), _log, () => _now, saves)
+        {
+            Poll = TimeSpan.FromMilliseconds(5),
+        };
+        uploader.SequenceStarted(null);
+        uploader.Start();
+        try
+        {
+            var finish = uploader.FinishSessionAsync(TimeSpan.FromMinutes(5), CancellationToken.None);
+            await Task.Delay(100, TestContext.Current.CancellationToken);
+            Assert.False(finish.IsCompleted); // the image may not have shown up yet
+
+            saves.SaveStarted(); // NINA's save worker picks the dark up
+            _now += TimeSpan.FromSeconds(13);
+            uploader.FrameSaved(Frame("dark.fits"), null);
+            saves.SaveFinished();
+            await Task.Delay(100, TestContext.Current.CancellationToken);
+            Assert.False(finish.IsCompleted); // quiet counts from the save
+
+            _now += SaveTracker.DefaultQuiet;
+            Assert.True(await finish);
+            Assert.Single(_server.Calls, c => c.Path == "/capture/sessions");
+            Assert.Equal(
+                new[] { "/capture/sessions", "/capture/sessions/s1/frames/dark.fits", "/capture/sessions/s1/end" },
+                _server.Calls.Select(c => c.Path).ToArray());
+        }
+        finally
+        {
+            await uploader.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task A_frame_saved_after_the_end_joins_the_ended_session()
+    {
+        var (queue, uploader) = Make();
+        uploader.SequenceStarted(null);
+        uploader.SequenceFinished();
+        await Drain(uploader);
+        _now += TimeSpan.FromSeconds(13);
+        uploader.FrameSaved(Frame("late.fits"), null);
+        await Drain(uploader);
+        Assert.Equal("/capture/sessions/s1/frames/late.fits", _server.Calls[^1].Path);
+        Assert.Single(_server.Calls, c => c.Path == "/capture/sessions");
+        Assert.Null(queue.LoadSession()); // the session stays ended
+    }
+
+    [Fact]
+    public async Task A_frame_long_after_the_end_starts_a_new_session()
+    {
+        var (_, uploader) = Make();
+        uploader.SequenceStarted(null);
+        uploader.SequenceFinished();
+        await Drain(uploader);
+        _now += Uploader.LateFrameWindow + TimeSpan.FromMinutes(1);
+        uploader.FrameSaved(Frame("next.fits"), null);
+        await Drain(uploader);
+        Assert.Equal("/capture/sessions/s2/frames/next.fits", _server.Calls[^1].Path);
+    }
+
+    [Fact]
+    public async Task A_late_frame_the_ended_session_refuses_starts_a_new_one()
+    {
+        var (queue, uploader) = Make();
+        uploader.SequenceStarted(null);
+        uploader.SequenceFinished();
+        await Drain(uploader);
+        uploader.FrameSaved(Frame("late.fits"), null);
+        _server.Script.Enqueue(HttpStatusCode.NotFound); // the server no longer knows s1
+        await Drain(uploader);
+        Assert.Equal("/capture/sessions/s1/frames/late.fits", _server.Calls[^3].Path);
+        Assert.Equal("/capture/sessions", _server.Calls[^2].Path);
+        Assert.Equal("/capture/sessions/s2/frames/late.fits", _server.Calls[^1].Path);
+        Assert.Null(queue.LoadEndedSession());
+        Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
+    public async Task A_new_sequence_forgets_the_ended_session()
+    {
+        var (queue, uploader) = Make();
+        uploader.SequenceStarted(null);
+        uploader.SequenceFinished();
+        uploader.SequenceStarted(null);
+        uploader.FrameSaved(Frame("a.fits"), null);
+        await Drain(uploader);
+        Assert.Null(queue.LoadEndedSession());
+        Assert.Equal("/capture/sessions/s2/frames/a.fits", _server.Calls[^1].Path);
+    }
+
     [Theory]
     [InlineData(HttpStatusCode.OK, false, Outcome.Ok)]
     [InlineData(HttpStatusCode.Forbidden, false, Outcome.Pause)]

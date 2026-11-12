@@ -11,6 +11,7 @@ using System.Windows.Input;
 using Bortle.Capture;
 using NINA.Core.Utility;
 using NINA.Core.Utility.Notification;
+using NINA.Equipment.Interfaces.Mediator;
 using NINA.Plugin;
 using NINA.Plugin.Interfaces;
 using NINA.Profile;
@@ -36,6 +37,8 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
 
     private readonly IProfileService _profile;
     private readonly IImageSaveMediator _images;
+    private readonly IImagingMediator _imaging;
+    private readonly SaveTracker _saves = new();
     private readonly ISequenceMediator _sequence;
     private readonly IPluginOptionsAccessor _options;
     private readonly Uploader _uploader;
@@ -46,10 +49,12 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
     public event PropertyChangedEventHandler? PropertyChanged;
 
     [ImportingConstructor]
-    public BortlePlugin(IProfileService profile, IImageSaveMediator images, ISequenceMediator sequence)
+    public BortlePlugin(
+        IProfileService profile, IImageSaveMediator images, IImagingMediator imaging, ISequenceMediator sequence)
     {
         _profile = profile;
         _images = images;
+        _imaging = imaging;
         _sequence = sequence;
         _options = new PluginOptionsAccessor(profile, Guid.Parse(Identifier));
 
@@ -59,11 +64,15 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         // retried, never waited on forever.
         var http = new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
         _client = new BortleClient(http, () => new ClientSettings(ServerUrl, PluginKey));
-        _uploader = new Uploader(new FrameQueue(dataDir), _client, new NinaLog());
+        _uploader = new Uploader(new FrameQueue(dataDir), _client, new NinaLog(), saves: _saves);
         _uploader.StatusChanged += () => Raise(nameof(StatusText));
         Uploader = _uploader;
 
         TestConnectionCommand = new RelayCommand(async () => await TestConnectionAsync());
+        // What NINA still has on its way to disk (SaveTracker): an image is
+        // prepared, picked up by the save worker, then written.
+        _imaging.ImagePrepared += OnImagePrepared;
+        _images.BeforeImageSaved += OnBeforeImageSaved;
         _images.ImageSaved += OnImageSaved;
         _profile.ProfileChanged += OnProfileChanged;
         _ = SubscribeSequenceAsync();
@@ -161,6 +170,14 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
 
     // --- NINA's events -----------------------------------------------------------
 
+    private void OnImagePrepared(object? sender, ImagePreparedEventArgs e) => _saves.Activity();
+
+    private Task OnBeforeImageSaved(object sender, BeforeImageSavedEventArgs e)
+    {
+        _saves.SaveStarted();
+        return Task.CompletedTask;
+    }
+
     private void OnImageSaved(object? sender, ImageSavedEventArgs e)
     {
         try
@@ -187,6 +204,12 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         catch (Exception ex)
         {
             Logger.Error($"Bortle: could not queue a frame: {ex}");
+        }
+        finally
+        {
+            // After the frame is queued: once this counts as saved, a session
+            // end may be queued behind it.
+            _saves.SaveFinished();
         }
     }
 
@@ -219,7 +242,15 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
     {
         try
         {
-            if (UploadEnabled) _uploader.SequenceFinished();
+            // NINA raises this right after the last instruction, while the
+            // last image is still being saved; end the session behind it.
+            if (UploadEnabled)
+            {
+                _ = _uploader.EndAfterSavesAsync(TimeSpan.FromMinutes(10), CancellationToken.None)
+                    .ContinueWith(
+                        t => Logger.Error($"Bortle: could not queue the session end: {t.Exception}"),
+                        TaskContinuationOptions.OnlyOnFaulted);
+            }
         }
         catch (Exception ex)
         {
@@ -238,6 +269,8 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
 
     public override async Task Teardown()
     {
+        _imaging.ImagePrepared -= OnImagePrepared;
+        _images.BeforeImageSaved -= OnBeforeImageSaved;
         _images.ImageSaved -= OnImageSaved;
         _profile.ProfileChanged -= OnProfileChanged;
         _sequence.SequenceStarting -= OnSequenceStarting;
