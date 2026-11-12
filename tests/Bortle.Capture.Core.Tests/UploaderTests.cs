@@ -228,6 +228,31 @@ public sealed class UploaderTests : IDisposable
     }
 
     [Fact]
+    public async Task Typing_a_key_sends_one_request_after_the_typing_not_one_per_keystroke()
+    {
+        var (queue, uploader) = Make();
+        uploader.SettingsSettle = TimeSpan.FromMilliseconds(300);
+        uploader.Start();
+        Assert.True(await Eventually(() => uploader.Status.State == UploaderState.Idle));
+        _server.Script.Enqueue(HttpStatusCode.Unauthorized);
+        uploader.FrameSaved(Frame("a.fits"), null);
+        Assert.True(await Eventually(() => uploader.Status.Problem == UploadProblem.KeyRejected));
+        var before = _server.Calls.Count;
+        // the field saves on every keystroke: 20 characters, 30 ms apart
+        for (var i = 0; i < 20; i++)
+        {
+            uploader.SettingsChanged();
+            await Task.Delay(30);
+        }
+        Assert.Equal(before, _server.Calls.Count); // nothing sent while typing
+        Assert.True(await Eventually(() => queue.Count == 0), "the finished key was not tried");
+        // once quiet: session start + frame, i.e. one attempt
+        Assert.Equal(before + 2, _server.Calls.Count);
+        await uploader.StopAsync();
+        uploader.Dispose();
+    }
+
+    [Fact]
     public async Task A_connection_test_resets_the_backoff()
     {
         var (queue, uploader) = Make();

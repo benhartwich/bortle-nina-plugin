@@ -89,7 +89,7 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         {
             _options.SetValueString(nameof(ServerUrl), (value ?? "").Trim());
             Raise();
-            _uploader.Wake();
+            _uploader.SettingsChanged();
         }
     }
 
@@ -100,7 +100,7 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         {
             _options.SetValueString(nameof(PluginKey), (value ?? "").Trim());
             Raise();
-            _uploader.Wake();
+            _uploader.SettingsChanged();
         }
     }
 

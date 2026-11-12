@@ -72,6 +72,15 @@ public sealed class Uploader : IDisposable
     internal static readonly TimeSpan PauseFor = TimeSpan.FromMinutes(5);
     internal static readonly TimeSpan KeyPause = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// Quiet time after the last settings change before the uploader looks
+    /// again. The option fields save on every keystroke; waking on each would
+    /// send one request per typed character — every one a 401 with half a key.
+    /// </summary>
+    internal TimeSpan SettingsSettle { get; set; } = TimeSpan.FromSeconds(1.5);
+
+    private Timer? _settle;
+
     private readonly FrameQueue _queue;
     private readonly BortleClient _client;
     private readonly ILog _log;
@@ -122,6 +131,29 @@ public sealed class Uploader : IDisposable
             Publish(UploaderState.Idle, null);
         }
         Wake();
+    }
+
+    /// <summary>
+    /// The server address or key changed (possibly mid-typing): look at the
+    /// queue once the field has been quiet for <see cref="SettingsSettle"/>.
+    /// </summary>
+    public void SettingsChanged()
+    {
+        lock (_wake)
+        {
+            // never throw on the timer thread: that would take NINA down
+            _settle ??= new Timer(_ =>
+            {
+                try
+                {
+                    Wake();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            });
+            _settle.Change(SettingsSettle, Timeout.InfiniteTimeSpan);
+        }
     }
 
     /// <summary>Look at the queue now (something was added, or the settings changed).</summary>
@@ -212,6 +244,7 @@ public sealed class Uploader : IDisposable
     public void Dispose()
     {
         _queue.Changed -= Wake;
+        _settle?.Dispose();
         _stop.Cancel();
         _stop.Dispose();
         _wake.Dispose();

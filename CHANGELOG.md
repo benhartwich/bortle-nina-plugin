@@ -11,6 +11,11 @@
   NINA-Profil" or "Schlüssel abgewiesen (401) – im aktiven Profil prüfen".
   A refused key also raises one NINA notification, not one per retry.
 - A full storage quota keeps the long pause.
+- The server address and key fields save on every change, not when the field
+  loses focus: a pasted key is in the profile even if NINA is closed or
+  *Verbindung testen* is clicked right away. The uploader waits 1.5 s after
+  the last change before trying again, so typing sends no request per
+  keystroke.
 
 ## 0.1.0.2
 
