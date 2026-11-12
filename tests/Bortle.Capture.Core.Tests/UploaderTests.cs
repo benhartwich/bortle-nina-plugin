@@ -133,25 +133,140 @@ public sealed class UploaderTests : IDisposable
     }
 
     [Fact]
-    public async Task A_wrong_key_pauses_without_losing_anything()
+    public async Task A_wrong_key_pauses_briefly_without_losing_anything()
     {
         var (queue, uploader) = Make();
         uploader.FrameSaved(Frame("a.fits"), null);
         _server.Script.Enqueue(HttpStatusCode.Unauthorized);
-        Assert.Equal(Uploader.PauseFor, await uploader.StepAsync(CancellationToken.None));
+        // short: the key may be fixed (or the profile switched back) any moment
+        Assert.Equal(Uploader.KeyPause, await uploader.StepAsync(CancellationToken.None));
+        Assert.True(Uploader.KeyPause <= TimeSpan.FromMinutes(1));
         Assert.Equal(UploaderState.Paused, uploader.Status.State);
+        Assert.Equal(UploadProblem.KeyRejected, uploader.Status.Problem);
         Assert.Equal(1, queue.Count);
     }
 
     [Fact]
-    public async Task Without_settings_nothing_is_sent()
+    public async Task Without_settings_nothing_is_sent_and_the_pause_is_short()
     {
         _settings = new ClientSettings("", "");
         var (queue, uploader) = Make();
         uploader.FrameSaved(Frame("a.fits"), null);
-        Assert.Equal(Uploader.PauseFor, await uploader.StepAsync(CancellationToken.None));
+        Assert.Equal(Uploader.KeyPause, await uploader.StepAsync(CancellationToken.None));
+        Assert.Equal(UploadProblem.KeyMissing, uploader.Status.Problem);
         Assert.Empty(_server.Calls);
         Assert.Equal(1, queue.Count);
+    }
+
+    [Fact]
+    public async Task A_full_quota_keeps_the_long_pause()
+    {
+        var (queue, uploader) = Make();
+        uploader.FrameSaved(Frame("a.fits"), null);
+        _server.Script.Enqueue(HttpStatusCode.RequestEntityTooLarge);
+        Assert.Equal(Uploader.PauseFor, await uploader.StepAsync(CancellationToken.None));
+        Assert.Equal(UploadProblem.Quota, uploader.Status.Problem);
+        Assert.Equal(1, queue.Count);
+    }
+
+    [Fact]
+    public async Task The_key_is_read_again_on_every_step()
+    {
+        // NINA keeps the key in the ACTIVE profile; a key that appears later
+        // (profile loaded, switched, or pasted) is used on the next step.
+        _settings = new ClientSettings("https://bortle.example/", "");
+        var (queue, uploader) = Make();
+        uploader.FrameSaved(Frame("a.fits"), null);
+        Assert.Equal(Uploader.KeyPause, await uploader.StepAsync(CancellationToken.None));
+        _settings = new ClientSettings("https://bortle.example/", "bnp_secret");
+        Assert.Null(await uploader.StepAsync(CancellationToken.None)); // session opened, frame sent
+        Assert.Equal(0, queue.Count);
+        Assert.All(_server.Calls, c => Assert.Equal("Bearer bnp_secret", c.Auth));
+        Assert.Equal(UploadProblem.None, uploader.Status.Problem);
+    }
+
+    /// <summary>Run the real loop and wait until <paramref name="done"/> or time out.</summary>
+    private static async Task<bool> Eventually(Func<bool> done, int ms = 5000)
+    {
+        var until = DateTime.UtcNow.AddMilliseconds(ms);
+        while (DateTime.UtcNow < until)
+        {
+            if (done()) return true;
+            await Task.Delay(20);
+        }
+        return done();
+    }
+
+    [Fact]
+    public async Task A_new_frame_wakes_an_idle_uploader()
+    {
+        var (queue, uploader) = Make();
+        uploader.Start();
+        // the loop found nothing and sleeps for a minute
+        Assert.True(await Eventually(() => uploader.Status.State == UploaderState.Idle));
+        uploader.FrameSaved(Frame("a.fits"), null);
+        Assert.True(await Eventually(() => queue.Count == 0), "the frame waited for the idle minute");
+        await uploader.StopAsync();
+    }
+
+    [Fact]
+    public async Task A_successful_connection_test_ends_the_pause_at_once()
+    {
+        var (queue, uploader) = Make();
+        uploader.Start();
+        Assert.True(await Eventually(() => uploader.Status.State == UploaderState.Idle));
+        _server.Script.Enqueue(HttpStatusCode.Unauthorized);
+        uploader.FrameSaved(Frame("a.fits"), null);
+        Assert.True(await Eventually(() => uploader.Status.Problem == UploadProblem.KeyRejected));
+        await Task.Delay(300);
+        Assert.Equal(1, queue.Count); // paused: nothing goes until the 30 s are up
+        Assert.Equal(UploadProblem.KeyRejected, uploader.Status.Problem);
+        // the person fixes the key and presses "Verbindung testen"
+        uploader.ConnectionConfirmed();
+        Assert.True(await Eventually(() => queue.Count == 0), "the frame waited out the pause");
+        await uploader.StopAsync();
+    }
+
+    [Fact]
+    public async Task A_connection_test_resets_the_backoff()
+    {
+        var (queue, uploader) = Make();
+        uploader.FrameSaved(Frame("a.fits"), null);
+        _server.Script.Enqueue(HttpStatusCode.InternalServerError);
+        _server.Script.Enqueue(HttpStatusCode.InternalServerError);
+        Assert.Equal(Uploader.FirstRetry, await uploader.StepAsync(CancellationToken.None));
+        Assert.Equal(Uploader.FirstRetry * 2, await uploader.StepAsync(CancellationToken.None));
+        uploader.ConnectionConfirmed();
+        _server.Script.Enqueue(HttpStatusCode.InternalServerError);
+        Assert.Equal(Uploader.FirstRetry, await uploader.StepAsync(CancellationToken.None));
+        Assert.Equal(1, queue.Count);
+    }
+
+    [Fact]
+    public void The_status_line_names_the_key_problem_plainly()
+    {
+        var missing = new UploaderStatus(UploaderState.Paused, 3, "x", null, null, UploadProblem.KeyMissing);
+        var rejected = new UploaderStatus(UploaderState.Paused, 3, "HTTP 401", null, null, UploadProblem.KeyRejected);
+        Assert.Contains("Schlüssel fehlt in diesem NINA-Profil", StatusText.Describe(missing));
+        Assert.Contains("Schlüssel abgewiesen (401) – im aktiven Profil prüfen", StatusText.Describe(rejected));
+        Assert.Contains("3 in der Warteschlange", StatusText.Describe(rejected));
+        var fine = new UploaderStatus(UploaderState.Idle, 0, null, null, null);
+        Assert.DoesNotContain("Schlüssel", StatusText.Describe(fine));
+    }
+
+    [Fact]
+    public void A_rejected_key_is_announced_once_until_uploads_work_again()
+    {
+        var warning = new KeyWarning();
+        var rejected = new UploaderStatus(UploaderState.Paused, 1, null, null, null, UploadProblem.KeyRejected);
+        Assert.True(warning.ShouldWarn(rejected));
+        // each 30 s retry publishes "Sending", then the refusal again: quiet
+        Assert.False(warning.ShouldWarn(new UploaderStatus(UploaderState.Sending, 1, null, null, null)));
+        Assert.False(warning.ShouldWarn(rejected));
+        // a frame went through, later the key is refused again: say it again
+        var sent = new DateTimeOffset(2026, 11, 12, 21, 16, 0, TimeSpan.Zero);
+        Assert.False(warning.ShouldWarn(new UploaderStatus(UploaderState.Sending, 0, null, sent, null)));
+        Assert.True(warning.ShouldWarn(rejected with { LastSent = sent }));
     }
 
     [Fact]
@@ -367,7 +482,8 @@ public sealed class UploaderTests : IDisposable
 
     [Theory]
     [InlineData(HttpStatusCode.OK, false, Outcome.Ok)]
-    [InlineData(HttpStatusCode.Forbidden, false, Outcome.Pause)]
+    [InlineData(HttpStatusCode.Unauthorized, false, Outcome.KeyRejected)]
+    [InlineData(HttpStatusCode.Forbidden, false, Outcome.KeyRejected)]
     [InlineData(HttpStatusCode.RequestEntityTooLarge, true, Outcome.Pause)]
     [InlineData(HttpStatusCode.NotFound, true, Outcome.SessionGone)]
     [InlineData(HttpStatusCode.NotFound, false, Outcome.Retry)]

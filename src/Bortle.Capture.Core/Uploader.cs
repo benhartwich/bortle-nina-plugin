@@ -17,12 +17,25 @@ public enum UploaderState
     Stopped,
 }
 
+/// <summary>What a person has to fix, when the uploader is paused for one.</summary>
+public enum UploadProblem
+{
+    None,
+    /// <summary>No server address or key in the active NINA profile.</summary>
+    KeyMissing,
+    /// <summary>The server refused the key.</summary>
+    KeyRejected,
+    /// <summary>The account's storage is full.</summary>
+    Quota,
+}
+
 public sealed record UploaderStatus(
     UploaderState State,
     int Waiting,
     string? Message,
     DateTimeOffset? LastSent,
-    string? SessionId);
+    string? SessionId,
+    UploadProblem Problem = UploadProblem.None);
 
 /// <summary>
 /// Sends the queue to Bortle, one entry after the other, in a background task.
@@ -31,7 +44,15 @@ public sealed record UploaderStatus(
 /// entry at the head and waits — 10 s, doubling up to 5 min — so a night with
 /// the server down loses nothing and the frames follow when it is back. A
 /// refusal a person has to fix (wrong key, quota) pauses until the settings
-/// change. Frames the server will never take are skipped and logged.
+/// change or a connection test succeeds. Frames the server will never take
+/// are skipped and logged.
+///
+/// A key problem pauses only briefly (<see cref="KeyPause"/>): the key lives
+/// in the ACTIVE NINA profile and is read again on every step, so a profile
+/// switch or a key pasted a moment later must not leave a night's frames
+/// waiting for minutes — that is what made "Verbindung testen" look like the
+/// only way to get uploads going again (2026-11-12). A full quota needs a
+/// person and keeps the long pause.
 /// </summary>
 public sealed class Uploader : IDisposable
 {
@@ -49,6 +70,7 @@ public sealed class Uploader : IDisposable
     internal static readonly TimeSpan FirstRetry = TimeSpan.FromSeconds(10);
     internal static readonly TimeSpan MaxRetry = TimeSpan.FromMinutes(5);
     internal static readonly TimeSpan PauseFor = TimeSpan.FromMinutes(5);
+    internal static readonly TimeSpan KeyPause = TimeSpan.FromSeconds(30);
 
     private readonly FrameQueue _queue;
     private readonly BortleClient _client;
@@ -87,6 +109,20 @@ public sealed class Uploader : IDisposable
     internal TimeSpan Poll { get; set; } = TimeSpan.FromMilliseconds(500);
 
     public void Start() => _loop ??= Task.Run(() => RunAsync(_stop.Token));
+
+    /// <summary>
+    /// The server just accepted the key (a connection test): forget any
+    /// backoff or pause and send what is waiting now.
+    /// </summary>
+    public void ConnectionConfirmed()
+    {
+        _retry = FirstRetry;
+        if (_status.Problem is UploadProblem.KeyMissing or UploadProblem.KeyRejected)
+        {
+            Publish(UploaderState.Idle, null);
+        }
+        Wake();
+    }
 
     /// <summary>Look at the queue now (something was added, or the settings changed).</summary>
     public void Wake()
@@ -247,8 +283,14 @@ public sealed class Uploader : IDisposable
                 // start a fresh one and send the same entry again.
                 _queue.SaveSession(null);
                 return null;
+            case Outcome.KeyMissing:
+                Publish(UploaderState.Paused, message, UploadProblem.KeyMissing);
+                return KeyPause;
+            case Outcome.KeyRejected:
+                Publish(UploaderState.Paused, message, UploadProblem.KeyRejected);
+                return KeyPause;
             case Outcome.Pause:
-                Publish(UploaderState.Paused, message);
+                Publish(UploaderState.Paused, message, UploadProblem.Quota);
                 return PauseFor;
             default:
                 Publish(UploaderState.Retrying, message);
@@ -348,7 +390,7 @@ public sealed class Uploader : IDisposable
         _ => "session end",
     };
 
-    private void Publish(UploaderState state, string? message)
+    private void Publish(UploaderState state, string? message, UploadProblem problem = UploadProblem.None)
     {
         _status = _status with
         {
@@ -356,6 +398,7 @@ public sealed class Uploader : IDisposable
             Waiting = _queue.Count,
             Message = message,
             SessionId = _queue.LoadSession()?.Id,
+            Problem = problem,
         };
         StatusChanged?.Invoke();
     }

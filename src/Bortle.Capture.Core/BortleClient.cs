@@ -24,8 +24,12 @@ public enum Outcome
     Retry,
     /// <summary>The server will never take this (not a FITS frame); skip it.</summary>
     Drop,
-    /// <summary>Nothing will go through until a person acts (wrong key, quota full).</summary>
+    /// <summary>Nothing will go through until a person acts (quota full).</summary>
     Pause,
+    /// <summary>No server address or no key in the active NINA profile.</summary>
+    KeyMissing,
+    /// <summary>The server refused the key (401/403): wrong key, revoked, or another profile's.</summary>
+    KeyRejected,
     /// <summary>The server does not know our session (any more); start a new one.</summary>
     SessionGone,
 }
@@ -144,7 +148,7 @@ public sealed class BortleClient
         var settings = _settings();
         if (!settings.IsComplete)
         {
-            return new(Outcome.Pause, default, "Bortle server address or plugin key is missing");
+            return new(Outcome.KeyMissing, default, "Bortle server address or plugin key is missing");
         }
         var baseUri = new Uri(settings.ServerUrl.Trim().TrimEnd('/') + "/");
         using var request = new HttpRequestMessage(method, new Uri(baseUri, path)) { Content = content };
@@ -184,7 +188,7 @@ public sealed class BortleClient
     {
         var code = (int)status;
         if (code is >= 200 and < 300) return Outcome.Ok;
-        if (status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return Outcome.Pause;
+        if (status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return Outcome.KeyRejected;
         if (status == HttpStatusCode.RequestEntityTooLarge) return Outcome.Pause; // quota
         if (status == HttpStatusCode.NotFound) return sessionScoped ? Outcome.SessionGone : Outcome.Retry;
         if (status is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests) return Outcome.Retry;

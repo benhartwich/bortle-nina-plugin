@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0.3
+
+- A missing or refused key pauses uploads for 30 s, not 5 minutes. The key
+  lives in the active NINA profile and is read again on every attempt, so a
+  profile switch or a key pasted a moment later no longer leaves frames
+  waiting until someone presses *Verbindung testen*.
+- A successful *Verbindung testen* ends any pause and backoff at once.
+- The status line says what is wrong: "Schlüssel fehlt in diesem
+  NINA-Profil" or "Schlüssel abgewiesen (401) – im aktiven Profil prüfen".
+  A refused key also raises one NINA notification, not one per retry.
+- A full storage quota keeps the long pause.
+
 ## 0.1.0.2
 
 - *Finish Bortle session* (and NINA's own end of a sequence) waits until NINA

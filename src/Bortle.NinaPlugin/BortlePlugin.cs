@@ -44,6 +44,7 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
     private readonly Uploader _uploader;
     private readonly BortleClient _client;
     private bool _warnedFormat;
+    private readonly KeyWarning _keyWarning = new();
     private string _testResult = "";
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -65,7 +66,7 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         var http = new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
         _client = new BortleClient(http, () => new ClientSettings(ServerUrl, PluginKey));
         _uploader = new Uploader(new FrameQueue(dataDir), _client, new NinaLog(), saves: _saves);
-        _uploader.StatusChanged += () => Raise(nameof(StatusText));
+        _uploader.StatusChanged += OnUploaderStatus;
         Uploader = _uploader;
 
         TestConnectionCommand = new RelayCommand(async () => await TestConnectionAsync());
@@ -113,24 +114,7 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         }
     }
 
-    public string StatusText
-    {
-        get
-        {
-            var s = _uploader.Status;
-            var state = s.State switch
-            {
-                UploaderState.Idle => "Alles übertragen",
-                UploaderState.Sending => "Überträgt",
-                UploaderState.Retrying => "Neuer Versuch gleich",
-                UploaderState.Paused => "Angehalten",
-                _ => "Gestoppt",
-            };
-            var line = $"{state} · {s.Waiting} in der Warteschlange";
-            if (s.LastSent is { } at) line += $" · zuletzt {at.ToLocalTime():HH:mm:ss}";
-            return string.IsNullOrEmpty(s.Message) ? line : $"{line}\n{s.Message}";
-        }
-    }
+    public string StatusText => Bortle.Capture.StatusText.Describe(_uploader.Status);
 
     public string TestResult
     {
@@ -160,11 +144,22 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
                 : "Kein Plan für heute";
             var level = hello.Value.Plan?.DevelopLevel ?? hello.Value.Level?.Level ?? "auto";
             TestResult = $"Verbunden als {hello.Value.Owner} · {plan} · Entwicklung: {level}";
-            _uploader.Wake();
+            _uploader.ConnectionConfirmed();
         }
         catch (Exception e)
         {
             TestResult = $"Keine Verbindung: {e.Message}";
+        }
+    }
+
+    private void OnUploaderStatus()
+    {
+        Raise(nameof(StatusText));
+        if (_keyWarning.ShouldWarn(_uploader.Status))
+        {
+            Notification.ShowWarning(
+                "Bortle: " + Bortle.Capture.StatusText.KeyRejected
+                + ". Die Plugin-Einstellungen gelten je NINA-Profil (Optionen → Plugins → Bortle).");
         }
     }
 
