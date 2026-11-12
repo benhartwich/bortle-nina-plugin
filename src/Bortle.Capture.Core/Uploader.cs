@@ -39,6 +39,13 @@ public sealed class Uploader : IDisposable
     /// a session we have not used for as long is last night's.</summary>
     public static readonly TimeSpan SessionIdle = TimeSpan.FromHours(6);
 
+    /// <summary>
+    /// A frame saved this long after its session ended still goes to that
+    /// session: NINA writes the last image of a sequence in the background,
+    /// after the sequence (and "Finish Bortle session") moved on.
+    /// </summary>
+    public static readonly TimeSpan LateFrameWindow = TimeSpan.FromMinutes(30);
+
     internal static readonly TimeSpan FirstRetry = TimeSpan.FromSeconds(10);
     internal static readonly TimeSpan MaxRetry = TimeSpan.FromMinutes(5);
     internal static readonly TimeSpan PauseFor = TimeSpan.FromMinutes(5);
@@ -47,6 +54,7 @@ public sealed class Uploader : IDisposable
     private readonly BortleClient _client;
     private readonly ILog _log;
     private readonly Func<DateTimeOffset> _clock;
+    private readonly SaveTracker? _saves;
     private readonly SemaphoreSlim _wake = new(0);
     private readonly CancellationTokenSource _stop = new();
     private Task? _loop;
@@ -55,17 +63,28 @@ public sealed class Uploader : IDisposable
 
     public event Action? StatusChanged;
 
-    public Uploader(FrameQueue queue, BortleClient client, ILog log, Func<DateTimeOffset>? clock = null)
+    public Uploader(
+        FrameQueue queue,
+        BortleClient client,
+        ILog log,
+        Func<DateTimeOffset>? clock = null,
+        SaveTracker? saves = null)
     {
         _queue = queue;
         _client = client;
         _log = log;
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
+        _saves = saves;
         _status = new UploaderStatus(UploaderState.Idle, queue.Count, null, null, queue.LoadSession()?.Id);
         _queue.Changed += Wake;
     }
 
     public UploaderStatus Status => _status;
+
+    /// <summary>How long NINA must be quiet before its last image counts as saved.</summary>
+    internal TimeSpan SaveQuiet { get; set; } = SaveTracker.DefaultQuiet;
+
+    internal TimeSpan Poll { get; set; } = TimeSpan.FromMilliseconds(500);
 
     public void Start() => _loop ??= Task.Run(() => RunAsync(_stop.Token));
 
@@ -85,22 +104,55 @@ public sealed class Uploader : IDisposable
     public QueueEntry SequenceFinished() => _queue.Enqueue(EntryKind.SessionEnd);
 
     /// <summary>
-    /// Report the end of the session once every frame before it has gone, and
-    /// wait for that — at most <paramref name="timeout"/>. True when the end
-    /// reached the server. On a timeout the end stays queued and follows the
-    /// frames later; nothing is lost either way.
+    /// Report the end of the session once NINA has saved every image it still
+    /// had on its way and every frame before the end has gone, and wait for
+    /// that — at most <paramref name="timeout"/> for both together. True when
+    /// the end reached the server. On a timeout the end stays queued and
+    /// follows the frames later, and an image saved after it still joins the
+    /// session (<see cref="LateFrameWindow"/>); nothing is lost either way.
     /// </summary>
     public async Task<bool> FinishSessionAsync(TimeSpan timeout, CancellationToken ct)
     {
-        var end = SequenceFinished();
         var deadline = _clock() + timeout;
+        var settled = await WaitForSavesAsync(deadline, ct).ConfigureAwait(false);
+        var end = SequenceFinished();
         while (_queue.HasPendingUpTo(end.Seq))
         {
             if (_clock() >= deadline)
             {
                 return false;
             }
-            await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+            await Task.Delay(Poll, ct).ConfigureAwait(false);
+        }
+        return settled;
+    }
+
+    /// <summary>
+    /// NINA's own "sequence finished": queue the end once its last images are
+    /// saved (at most <paramref name="timeout"/>), without holding NINA up.
+    /// </summary>
+    public async Task EndAfterSavesAsync(TimeSpan timeout, CancellationToken ct)
+    {
+        await WaitForSavesAsync(_clock() + timeout, ct).ConfigureAwait(false);
+        SequenceFinished();
+    }
+
+    /// <summary>True when NINA settled before the deadline.</summary>
+    private async Task<bool> WaitForSavesAsync(DateTimeOffset deadline, CancellationToken ct)
+    {
+        if (_saves is null)
+        {
+            return true;
+        }
+        var since = _clock();
+        while (!_saves.Settled(since, SaveQuiet))
+        {
+            if (_clock() >= deadline)
+            {
+                _log.Error($"Bortle: {_saves.InFlight} image(s) still being saved; ending the session anyway");
+                return false;
+            }
+            await Task.Delay(Poll, ct).ConfigureAwait(false);
         }
         return true;
     }
@@ -217,6 +269,7 @@ public sealed class Uploader : IDisposable
                 if (started.Outcome == Outcome.Ok && started.Value is { } info)
                 {
                     _queue.SaveSession(new SessionState(info.Id, _clock()));
+                    _queue.SaveEndedSession(null);
                     _log.Info($"Bortle session {info.Id} (develop level {info.Level})");
                 }
                 return (started.Outcome, started.Message);
@@ -226,6 +279,24 @@ public sealed class Uploader : IDisposable
                 if (entry.Path is null || !File.Exists(entry.Path))
                 {
                     return (Outcome.Drop, "the file is gone");
+                }
+                if (session is null && _queue.LoadEndedSession() is { } ended)
+                {
+                    if (_clock() - ended.LastUsed <= LateFrameWindow)
+                    {
+                        // Saved after its session ended: it still belongs there.
+                        var late = await _client.PutFrameAsync(ended.Id, entry.Path, entry.Target, ct)
+                            .ConfigureAwait(false);
+                        if (late.Outcome != Outcome.SessionGone)
+                        {
+                            if (late.Outcome == Outcome.Ok)
+                            {
+                                _log.Info($"Bortle: {Describe(entry)} joined session {ended.Id} after its end");
+                            }
+                            return (late.Outcome, late.Message);
+                        }
+                    }
+                    _queue.SaveEndedSession(null); // too late, or the server no longer knows it
                 }
                 if (session is null || _clock() - session.LastUsed > SessionIdle)
                 {
@@ -258,6 +329,8 @@ public sealed class Uploader : IDisposable
                 if (ended.Outcome is Outcome.Ok or Outcome.SessionGone)
                 {
                     _queue.SaveSession(null);
+                    _queue.SaveEndedSession(
+                        ended.Outcome == Outcome.Ok ? new SessionState(session.Id, _clock()) : null);
                     _log.Info($"Bortle session {session.Id} ended");
                     return (Outcome.Ok, null);
                 }

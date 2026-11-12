@@ -36,6 +36,7 @@ public sealed class FrameQueue
 {
     private readonly string _dir;
     private readonly string _sessionFile;
+    private readonly string _endedFile;
     private readonly object _lock = new();
     private long _nextSeq;
 
@@ -45,6 +46,7 @@ public sealed class FrameQueue
     {
         _dir = System.IO.Path.Combine(directory, "queue");
         _sessionFile = System.IO.Path.Combine(directory, "session.json");
+        _endedFile = System.IO.Path.Combine(directory, "ended-session.json");
         Directory.CreateDirectory(_dir);
         _nextSeq = Files().Select(SeqOf).DefaultIfEmpty(0).Max() + 1;
     }
@@ -122,14 +124,27 @@ public sealed class FrameQueue
         }
     }
 
-    public SessionState? LoadSession()
+    public SessionState? LoadSession() => Load(_sessionFile);
+
+    public void SaveSession(SessionState? state) => Save(_sessionFile, state);
+
+    /// <summary>
+    /// The session that ended last, and when: a frame NINA saves after the end
+    /// (it writes in the background, after the sequence moved on) still belongs
+    /// to it.
+    /// </summary>
+    public SessionState? LoadEndedSession() => Load(_endedFile);
+
+    public void SaveEndedSession(SessionState? state) => Save(_endedFile, state);
+
+    private SessionState? Load(string file)
     {
         lock (_lock)
         {
             try
             {
-                return File.Exists(_sessionFile)
-                    ? JsonSerializer.Deserialize<SessionState>(File.ReadAllText(_sessionFile))
+                return File.Exists(file)
+                    ? JsonSerializer.Deserialize<SessionState>(File.ReadAllText(file))
                     : null;
             }
             catch (Exception e) when (e is JsonException or IOException)
@@ -139,18 +154,18 @@ public sealed class FrameQueue
         }
     }
 
-    public void SaveSession(SessionState? state)
+    private void Save(string file, SessionState? state)
     {
         lock (_lock)
         {
             if (state is null)
             {
-                File.Delete(_sessionFile);
+                File.Delete(file);
                 return;
             }
-            var tmp = _sessionFile + ".tmp";
+            var tmp = file + ".tmp";
             File.WriteAllText(tmp, JsonSerializer.Serialize(state));
-            File.Move(tmp, _sessionFile, overwrite: true);
+            File.Move(tmp, file, overwrite: true);
         }
     }
 

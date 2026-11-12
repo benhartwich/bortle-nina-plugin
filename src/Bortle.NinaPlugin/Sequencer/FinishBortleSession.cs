@@ -12,7 +12,9 @@ namespace Bortle.NinaPlugin.Sequencer;
 /// <summary>
 /// "Finish Bortle session": the last instruction of a night, after the park.
 ///
-/// It waits until the frames still on their way have reached Bortle — at most
+/// It waits until NINA has saved the images it still had on its way (NINA
+/// writes the last one in the background, after the sequence moved on; see
+/// SaveTracker) and the frames have reached Bortle — at most
 /// <see cref="UploadTimeoutMinutes"/> — and then reports the end, which starts
 /// the development. It never fails and never throws except when the user stops
 /// the sequence: a server that is down costs the wait, never the night, and
