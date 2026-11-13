@@ -28,15 +28,17 @@ checksum is that zip's. Then check that:
 
 1. Fork `isbeorn/nina.plugin.manifests`.
 2. Take `Bortle.NinaPlugin.<version>.manifest.json` from the GitHub release.
-   Do not regenerate it.
+   Do not regenerate it. For a 0.x release add `"Channel": "Beta"` as the last
+   property (the checksum is the zip's, so this changes nothing else).
 3. Put it at `manifests/b/Bortle/3.2.0.9001/<version>/manifest.json`. The
    middle folder is the minimum N.I.N.A. version.
 4. Validate it: `npm install && node validate-latest-manifest.js` in the fork.
 5. Open the pull request with the text below.
 
-For a version that should only reach N.I.N.A.'s beta channel, the manifest
-repository describes a beta flag ("Releasing a Manifest as a Beta Version").
-A 0.x release is a candidate for it.
+A 0.x release goes to N.I.N.A.'s beta channel ("Releasing a Manifest as a
+Beta Version" in the manifest repository): users opt in by adding
+`https://nighttime-imaging.eu/wp-json/nina/v1/beta` under Options → General →
+Plugin Repositories.
 
 ## Pull request text
 
@@ -47,6 +49,11 @@ Bortle delivers the frames N.I.N.A. saves to Bortle (https://bortle.eu, or a
 self-hosted install), which stacks and develops them when the sequence ends.
 The plugin only delivers data: it controls no equipment and cannot delay or
 fail a sequence.
+
+Who can use it: Bortle is open source (AGPL-3.0) and can be self-hosted; the
+plugin works against any Bortle install. Sign-up on the hosted service at
+bortle.eu is currently by invitation, so for now most users will run their own
+install. Submitted to the beta channel while it is 0.x.
 
 Source: https://github.com/benhartwich/bortle-nina-plugin (AGPL-3.0)
 Release: https://github.com/benhartwich/bortle-nina-plugin/releases/tag/<version>
