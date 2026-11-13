@@ -38,7 +38,9 @@ using System.Runtime.InteropServices;
 The plugin only delivers data. It controls no equipment and never delays or
 fails a sequence; safety stays with NINA.
 
-Create the plugin key in Bortle under Profil → NINA-Plugin.
+Bortle.eu is in private beta: request access at https://bortle.eu
+(""Zugang beantragen""), or run your own install (open source). Then create
+the plugin key in Bortle under Profil → NINA-Plugin.
 
 Open source under the AGPL-3.0. Written with substantial help from an AI model
 (Anthropic's Claude) and maintained by Benjamin Hartwich; see the repository's
