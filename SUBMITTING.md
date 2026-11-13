@@ -50,10 +50,10 @@ self-hosted install), which stacks and develops them when the sequence ends.
 The plugin only delivers data: it controls no equipment and cannot delay or
 fail a sequence.
 
-Who can use it: Bortle is open source (AGPL-3.0) and can be self-hosted; the
-plugin works against any Bortle install. Sign-up on the hosted service at
-bortle.eu is currently by invitation, so for now most users will run their own
-install. Submitted to the beta channel while it is 0.x.
+Who can use it: the hosted service at bortle.eu is in private beta, and
+access is requested on https://bortle.eu ("Zugang beantragen"); each request
+is answered by hand. Bortle is also open source (AGPL-3.0) and can be
+self-hosted; the plugin works against any Bortle install. Submitted to the beta channel while it is 0.x.
 
 Source: https://github.com/benhartwich/bortle-nina-plugin (AGPL-3.0)
 Release: https://github.com/benhartwich/bortle-nina-plugin/releases/tag/<version>

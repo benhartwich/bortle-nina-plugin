@@ -51,6 +51,16 @@ When Bortle plans the night, it adds this instruction itself, provided
 N.I.N.A. lists this plugin as loaded. Without the instruction, the end of the
 sequence triggers the same thing.
 
+## Getting access
+
+You need a Bortle to deliver to. Two ways:
+
+- **Hosted, at bortle.eu (private beta):** request access on
+  [bortle.eu](https://bortle.eu) ("Zugang beantragen"). Each request is
+  answered by hand; once your account exists, continue with Setup below.
+- **Your own install:** Bortle is open source (AGPL-3.0) and runs on your own
+  machine; see [the Bortle repository](https://github.com/benhartwich/bortle).
+
 ## Setup
 
 1. In Bortle: **Profil → NINA-Plugin → Schlüssel erzeugen**. The key is shown
