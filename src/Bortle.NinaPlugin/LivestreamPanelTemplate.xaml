@@ -1,0 +1,45 @@
+<ResourceDictionary
+    x:Class="Bortle.NinaPlugin.LivestreamPanelTemplate"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- The panel's icon in NINA's imaging tab: a play triangle in a ring. -->
+    <GeometryGroup x:Key="Bortle_LivestreamIcon">
+        <EllipseGeometry Center="12,12" RadiusX="11" RadiusY="11" />
+        <EllipseGeometry Center="12,12" RadiusX="9" RadiusY="9" />
+        <PathGeometry Figures="M 9,7 L 18,12 L 9,17 Z" />
+    </GeometryGroup>
+
+    <!-- NINA finds a dockable's view by the key "<full type name>_Dockable". -->
+    <DataTemplate x:Key="Bortle.NinaPlugin.LivestreamPanel_Dockable">
+        <StackPanel Margin="8">
+            <TextBlock
+                Margin="0,0,0,4"
+                FontWeight="Bold"
+                Text="{Binding State}"
+                TextWrapping="Wrap" />
+            <TextBlock
+                Margin="0,0,0,8"
+                Text="{Binding Detail}"
+                TextWrapping="Wrap" />
+            <StackPanel Orientation="Horizontal">
+                <Button
+                    MinWidth="110"
+                    Height="28"
+                    Command="{Binding ToggleCommand}"
+                    Content="{Binding ButtonText}"
+                    IsEnabled="{Binding IsIdle}" />
+                <Button
+                    Height="28"
+                    Margin="6,0,0,0"
+                    Command="{Binding RefreshCommand}"
+                    Content="Aktualisieren" />
+            </StackPanel>
+            <TextBlock
+                Margin="0,8,0,0"
+                Opacity="0.7"
+                Text="Gesendet wird vom Bortle-Server aus den hochgeladenen Bildern; dein Rechner sendet kein Video."
+                TextWrapping="Wrap" />
+        </StackPanel>
+    </DataTemplate>
+</ResourceDictionary>

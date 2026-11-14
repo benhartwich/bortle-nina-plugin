@@ -33,6 +33,9 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
     /// <summary>For the sequence instruction, which NINA creates on its own.</summary>
     internal static Uploader? Uploader { get; private set; }
 
+    /// <summary>For the livestream panel, which NINA creates on its own too.</summary>
+    internal static BortleClient? Client { get; private set; }
+
     private static readonly string[] FitsSuffixes = { ".fits", ".fit", ".fts" };
 
     private readonly IProfileService _profile;
@@ -68,6 +71,7 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         _uploader = new Uploader(new FrameQueue(dataDir), _client, new NinaLog(), saves: _saves);
         _uploader.StatusChanged += OnUploaderStatus;
         Uploader = _uploader;
+        Client = _client;
 
         TestConnectionCommand = new RelayCommand(async () => await TestConnectionAsync());
         // What NINA still has on its way to disk (SaveTracker): an image is
@@ -274,6 +278,7 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         await _uploader.StopAsync();
         _uploader.Dispose();
         Uploader = null;
+        Client = null;
         await base.Teardown();
     }
 
