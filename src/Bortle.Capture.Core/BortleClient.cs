@@ -70,8 +70,27 @@ public sealed record Hello
     [JsonPropertyName("level")] public HelloLevel? Level { get; init; }
 }
 
+public sealed record LivestreamShowing
+{
+    [JsonPropertyName("target")] public string? Target { get; init; }
+    [JsonPropertyName("frames")] public int Frames { get; init; }
+    [JsonPropertyName("integration_s")] public double IntegrationSeconds { get; init; }
+}
+
+/// <summary>The account's livestream as the server sees it. Never the stream key.</summary>
+public sealed record LivestreamStatus
+{
+    [JsonPropertyName("allowed")] public bool Allowed { get; init; }
+    [JsonPropertyName("configured")] public bool Configured { get; init; }
+    [JsonPropertyName("state")] public string State { get; init; } = "off";
+    [JsonPropertyName("reason")] public string? Reason { get; init; }
+    [JsonPropertyName("showing")] public LivestreamShowing? Showing { get; init; }
+
+    public bool IsLive => State is "live" or "ending";
+}
+
 /// <summary>
-/// The four calls the plugin makes. Every endpoint lives under /capture/ and
+/// The calls the plugin makes. Every endpoint lives under /capture/ and
 /// takes the plugin key as a bearer token. Nothing here throws for a network
 /// or server problem: each call answers with an <see cref="Outcome"/>.
 /// </summary>
@@ -88,6 +107,19 @@ public sealed class BortleClient
 
     public Task<ApiResult<Hello>> HelloAsync(CancellationToken ct) =>
         SendAsync<Hello>(HttpMethod.Get, "capture/hello", null, ct);
+
+    /// <summary>
+    /// The livestream is made on the server from the frames this plugin
+    /// uploads anyway; the plugin only switches it on and off.
+    /// </summary>
+    public Task<ApiResult<LivestreamStatus>> LivestreamAsync(CancellationToken ct) =>
+        SendAsync<LivestreamStatus>(HttpMethod.Get, "capture/livestream", null, ct);
+
+    public Task<ApiResult<LivestreamStatus>> StartLivestreamAsync(CancellationToken ct) =>
+        SendAsync<LivestreamStatus>(HttpMethod.Post, "capture/livestream/start", null, ct);
+
+    public Task<ApiResult<LivestreamStatus>> StopLivestreamAsync(CancellationToken ct) =>
+        SendAsync<LivestreamStatus>(HttpMethod.Post, "capture/livestream/stop", null, ct);
 
     public Task<ApiResult<SessionInfo>> StartSessionAsync(string? sequence, CancellationToken ct) =>
         SendAsync<SessionInfo>(
