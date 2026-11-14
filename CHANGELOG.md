@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.1.0
+
+- New panel *Bortle Livestream* for N.I.N.A.'s imaging tab: one button to
+  stream the night to YouTube. The Bortle server makes the stream from the
+  frames the plugin uploads anyway, a growing live stack with the object,
+  frame count and exposure. This PC sends no video, and N.I.N.A. and the
+  equipment are not involved. The stream key is entered once in the Bortle
+  cockpit (Profil → Livestream), never in N.I.N.A. For now only the
+  operator of a Bortle instance can stream.
+
 ## 0.1.0.3
 
 - A missing or refused key pauses uploads for 30 s, not 5 minutes. The key

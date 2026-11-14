@@ -5,8 +5,8 @@ using System.Runtime.InteropServices;
 // plugin's settings under this GUID.
 [assembly: Guid("6f1c2b8e-4d0a-4e5b-9a63-2b7c0d9e5a41")]
 
-[assembly: AssemblyVersion("0.1.0.3")]
-[assembly: AssemblyFileVersion("0.1.0.3")]
+[assembly: AssemblyVersion("0.1.1.0")]
+[assembly: AssemblyFileVersion("0.1.1.0")]
 
 // [MANDATORY] The name NINA shows — and the name Bortle looks for in
 // /application/plugins before it puts "Finish Bortle session" into a sequence
@@ -34,6 +34,9 @@ using System.Runtime.InteropServices;
 - The ""Finish Bortle session"" instruction, placed last in the End area after
   parking, waits for the last frames and reports the end. Without it, the end
   of the sequence does the same.
+- The ""Bortle Livestream"" panel (imaging tab) streams the night to YouTube
+  with one button. Bortle makes the stream on its server from the uploaded
+  frames; this PC sends no video.
 
 The plugin only delivers data. It controls no equipment and never delays or
 fails a sequence; safety stays with NINA.
