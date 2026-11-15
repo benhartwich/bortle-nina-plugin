@@ -37,6 +37,18 @@ N.I.N.A.
    Bortle after every frame before it. Bortle then develops all nights of each
    target together.
 
+### Livestream
+
+The panel *Bortle Livestream* (imaging tab → the panel menu) has one button,
+*Live gehen*. It asks Bortle to stream the night to YouTube. The stream is
+made on the Bortle server from the frames this plugin uploads anyway: a
+growing live stack of the current target, with the object, frame count and
+total exposure, never the site. This PC sends no video, so the observatory's
+uplink and N.I.N.A. are not loaded by it. The YouTube stream key is entered
+once in the Bortle cockpit under *Profil → Livestream*, never in N.I.N.A.
+The stream ends by itself ten minutes after the sequence. For now only the
+operator of a Bortle instance can stream.
+
 Snapshots are not sent. Neither are images saved as XISF or TIFF: Bortle stacks
 FITS, and the plugin warns once.
 
@@ -77,7 +89,7 @@ You need a Bortle to deliver to. Two ways:
 ## The API it speaks
 
 Every call carries the plugin key as `Authorization: Bearer bnp_…`. A plugin
-key can do nothing but these four calls.
+key can do nothing but these calls.
 
 | Call | What it does |
 |---|---|
@@ -85,6 +97,8 @@ key can do nothing but these four calls.
 | `POST /capture/sessions` `{"sequence": …}` | Opens a session, or continues the one opened within the last hours. |
 | `PUT /capture/sessions/<id>/frames/<file>.fits?target=<name>` | One frame, streamed as the body. Sending the same frame twice stores it once. |
 | `POST /capture/sessions/<id>/end` | Closes the session, which starts the development. |
+| `GET /capture/livestream` | Whether the account's livestream is on and what it shows. Never the stream key. |
+| `POST /capture/livestream/start`, `…/stop` | Starts or ends the livestream the server sends. |
 
 How the answers are handled:
 - 401/403 and 413 (quota) pause the plugin.
