@@ -40,13 +40,17 @@ public sealed record QueueEntry
 /// made the entry), so a night sent late is judged as it happened.
 /// <see cref="Accepted"/>: the server has taken a frame into it.
 /// <see cref="Replaced"/>: opened because the server did not know the one before.
+/// <see cref="Misses"/>: 404s in a row; one is a passing proxy hiccup, not a lost session.
+/// <see cref="Touched"/>: when this process last wrote it (send time), for forgetting old ones.
 /// </remarks>
 public sealed record SessionState(
     string Id,
     DateTimeOffset LastUsed,
     DateTimeOffset? Ended = null,
     bool Accepted = false,
-    bool Replaced = false);
+    bool Replaced = false,
+    int Misses = 0,
+    DateTimeOffset? Touched = null);
 
 /// <summary>
 /// One owner's queue between NINA and the network, kept on disk.
@@ -77,6 +81,11 @@ public sealed class FrameQueue : IDisposable
     // One counter for the process: it orders entries of the same tick across
     // this process's queues (a profile's pending queue and its destination).
     private static long s_counter;
+
+    // The newest tick handed out: a clock stepped back (NTP) must not sort a
+    // later entry before an earlier one.
+    private static long s_lastTicks;
+    private static readonly object s_order = new();
 
     private readonly string _dir;
     private readonly string _sessionsFile;
@@ -110,7 +119,37 @@ public sealed class FrameQueue : IDisposable
     }
 
     /// <summary>Entries set aside as damaged.</summary>
-    public int DamagedCount => Directory.EnumerateFiles(_dir, "*.bad").Count();
+    public int DamagedCount => Directory.Exists(_dir) ? Directory.EnumerateFiles(_dir, "*.bad").Count() : 0;
+
+    /// <summary>The folder name, which is the owner's (see <see cref="QueueStore"/>).</summary>
+    public string Name => System.IO.Path.GetFileName(Root);
+
+    /// <summary>
+    /// For a profile's pending queue: the destination that took its first
+    /// entry. The rest follow it there, so one sequence never ends up on two keys.
+    /// </summary>
+    public string? PinnedTo
+    {
+        get
+        {
+            try
+            {
+                var file = System.IO.Path.Combine(Root, "pinned.txt");
+                return File.Exists(file) ? File.ReadAllText(file).Trim() : null;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                return null;
+            }
+        }
+        set
+        {
+            var file = System.IO.Path.Combine(Root, "pinned.txt");
+            Directory.CreateDirectory(Root);
+            if (value is null) File.Delete(file);
+            else File.WriteAllText(file, value);
+        }
+    }
 
     public string Root { get; }
 
@@ -131,17 +170,26 @@ public sealed class FrameQueue : IDisposable
         string? session,
         string? path = null,
         string? target = null,
-        string? sequence = null)
+        string? sequence = null,
+        Action<QueueEntry>? written = null)
     {
         QueueEntry entry;
         lock (_lock)
         {
+            // the folder may have been cleared by hand meanwhile
+            Directory.CreateDirectory(_dir);
             while (true)
             {
                 // Time first, so the names sort in the order things happened;
                 // the counter orders entries made in the same tick, the tag
                 // keeps two processes from ever choosing the same name.
-                var id = $"{created.UtcTicks:D19}-{Interlocked.Increment(ref s_counter):D9}-{Instance}";
+                long ticks;
+                lock (s_order)
+                {
+                    ticks = Math.Max(created.UtcTicks, s_lastTicks);
+                    s_lastTicks = ticks;
+                }
+                var id = $"{ticks:D19}-{Interlocked.Increment(ref s_counter):D9}-{Instance}";
                 entry = new QueueEntry
                 {
                     Id = id,
@@ -158,6 +206,8 @@ public sealed class FrameQueue : IDisposable
                 try
                 {
                     File.Move(tmp, final, overwrite: false);
+                    // before anyone is told: a held end must be held from its first moment
+                    written?.Invoke(entry);
                     break;
                 }
                 catch (IOException) when (File.Exists(final))
@@ -241,6 +291,7 @@ public sealed class FrameQueue : IDisposable
             if (_drainLock is not null) return true;
             try
             {
+                Directory.CreateDirectory(Root);
                 _drainLock = new FileStream(
                     _lockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.None);
                 return true;
@@ -277,12 +328,18 @@ public sealed class FrameQueue : IDisposable
         {
             var all = LoadSessions();
             if (state is null) all.Remove(logical);
-            else all[logical] = state;
-            // forget what no entry can still refer to
-            foreach (var key in all.Where(kv => now - kv.Value.LastUsed > TimeSpan.FromDays(3)).Select(kv => kv.Key).ToList())
+            else all[logical] = state with { Touched = now };
+            // Forget what this process has not touched for days. By send time,
+            // never by capture time: a night sent after a week offline must
+            // still find its own session.
+            foreach (var key in all
+                         .Where(kv => kv.Key != logical && now - (kv.Value.Touched ?? kv.Value.LastUsed) > TimeSpan.FromDays(3))
+                         .Select(kv => kv.Key)
+                         .ToList())
             {
                 all.Remove(key);
             }
+            Directory.CreateDirectory(Root);
             var tmp = _sessionsFile + "." + Instance + ".tmp";
             File.WriteAllText(tmp, JsonSerializer.Serialize(all));
             File.Move(tmp, _sessionsFile, overwrite: true);
@@ -327,7 +384,8 @@ public sealed class FrameQueue : IDisposable
 
     private string FileOf(string id) => System.IO.Path.Combine(_dir, id + ".json");
 
-    private IEnumerable<string> Files() => Directory.EnumerateFiles(_dir, "*.json");
+    private IEnumerable<string> Files() =>
+        Directory.Exists(_dir) ? Directory.EnumerateFiles(_dir, "*.json") : Enumerable.Empty<string>();
 
     private static void TryMove(string from, string to)
     {
@@ -426,6 +484,7 @@ public sealed class QueueStore : IDisposable
     {
         var skip = these.Where(q => q is not null).Select(q => System.IO.Path.GetFullPath(q!.Root)).ToHashSet();
         var total = 0;
+        if (!Directory.Exists(_root)) return 0;
         foreach (var dir in Directory.EnumerateDirectories(_root))
         {
             if (skip.Contains(System.IO.Path.GetFullPath(dir))) continue;

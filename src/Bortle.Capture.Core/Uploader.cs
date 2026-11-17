@@ -119,7 +119,7 @@ public sealed class Uploader : IDisposable
     private string? _current;
     private (string Id, DateTimeOffset At)? _lastEnded;
     private (string Id, DateTimeOffset LastUsed)? _adhoc;
-    private (string Id, int Left)? _carry;
+    private (string Id, int Left, DateTimeOffset Until)? _carry;
 
     // Session ends this process queued and still holds back until NINA has
     // saved the sequence's last images. Persisted like any entry, so closing
@@ -146,6 +146,23 @@ public sealed class Uploader : IDisposable
         _status = new UploaderStatus(UploaderState.Stopped, 0, null, null, null, Legacy: store.LegacyCount);
         _store.Changed += Wake;
         _store.Damaged += OnDamaged;
+        if (_saves is not null) _saves.Finished += OnSaveFinished;
+    }
+
+
+    /// <summary>
+    /// Each save that ends uses up one image the previous sequence still had
+    /// on its way, whether it became a frame or not (a snapshot, a JPEG).
+    /// </summary>
+    private void OnSaveFinished()
+    {
+        lock (_sessions)
+        {
+            if (_carry is { } carry)
+            {
+                _carry = carry.Left > 1 ? (carry.Id, carry.Left - 1, carry.Until) : null;
+            }
+        }
     }
 
     public UploaderStatus Status => _status;
@@ -233,7 +250,9 @@ public sealed class Uploader : IDisposable
             // Images NINA is still writing were taken by the sequence before.
             var previous = _current ?? _lastEnded?.Id;
             var inFlight = _saves?.InFlight ?? 0;
-            _carry = previous is not null && inFlight > 0 ? (previous, inFlight) : null;
+            _carry = previous is not null && inFlight > 0
+                ? (previous, inFlight, _clock() + SaveTracker.GiveUpAfter)
+                : null;
             if (_current is { } unfinished)
             {
                 _lastEnded = (unfinished, _clock());
@@ -297,27 +316,26 @@ public sealed class Uploader : IDisposable
         DateTimeOffset deadline, CancellationToken ct)
     {
         var session = TakeCurrent();
-        var (queue, held) = Enqueue(EntryKind.SessionEnd, session);
-        lock (_held) _held.Add(held.Id);
-        bool settled;
+        var queue = _store.For(_context());
+        var held = queue.Enqueue(
+            EntryKind.SessionEnd, _clock(), session, written: e => { lock (_held) _held.Add(e.Id); });
         try
         {
-            settled = await WaitForSavesAsync(deadline, ct).ConfigureAwait(false);
+            var settled = await WaitForSavesAsync(deadline, ct).ConfigureAwait(false);
+            // Behind the images saved meanwhile: queue it again at the tail,
+            // then drop the held copy. A crash in between leaves two ends of
+            // the same session; the second is a no-op.
+            var end = queue.Enqueue(EntryKind.SessionEnd, _clock(), session);
+            queue.Remove(held);
+            return (queue, (end, settled));
         }
-        catch (OperationCanceledException)
+        finally
         {
-            // stopped: release it as it is; it goes out after the frames queued so far
+            // whatever happened (stopped, a disk error), it must never stay
+            // held: at worst it goes out where it stands
             lock (_held) _held.Remove(held.Id);
             Wake();
-            throw;
         }
-        // Behind the images saved meanwhile: queue it again at the tail, then
-        // drop the held copy. A crash in between leaves two ends of the same
-        // session; the second is a no-op.
-        var end = queue.Enqueue(EntryKind.SessionEnd, _clock(), session);
-        queue.Remove(held);
-        lock (_held) _held.Remove(held.Id);
-        return (queue, (end, settled));
     }
 
     private (FrameQueue, QueueEntry) Enqueue(
@@ -348,10 +366,10 @@ public sealed class Uploader : IDisposable
         lock (_sessions)
         {
             var now = _clock();
-            if (_carry is { } carry && carry.Left > 0)
+            if (_carry is { } carry && carry.Left > 0 && now <= carry.Until)
             {
-                // an image the previous sequence took, written after this one began
-                _carry = carry.Left > 1 ? (carry.Id, carry.Left - 1) : null;
+                // an image the previous sequence took, written after this one
+                // began (OnSaveFinished counts it off)
                 return carry.Id;
             }
             if (_current is { } current) return current;
@@ -418,6 +436,7 @@ public sealed class Uploader : IDisposable
         }
         _store.Changed -= Wake;
         _store.Damaged -= OnDamaged;
+        if (_saves is not null) _saves.Finished -= OnSaveFinished;
         _store.Dispose(); // releases this process's drain locks
         _stop.Cancel();
         _stop.Dispose();
@@ -440,8 +459,15 @@ public sealed class Uploader : IDisposable
             catch (Exception e)
             {
                 // The loop must outlive anything; a bug costs a minute, not the night.
-                _log.Error($"Bortle upload: {e}");
-                Publish(UploaderState.Retrying, e.Message);
+                try
+                {
+                    _log.Error($"Bortle upload: {e}");
+                    Publish(UploaderState.Retrying, e.Message);
+                }
+                catch (Exception)
+                {
+                    // not even the status could be written; still keep going
+                }
                 wait = TimeSpan.FromMinutes(1);
             }
             if (wait is { } delay)
@@ -496,15 +522,25 @@ public sealed class Uploader : IDisposable
             return KeyPause;
         }
 
-        // Own the destination; own the pending queue only while it has
-        // something, and leave it to another NINA that holds it.
-        var usePending = pending.Count > 0 && pending.TryOwn();
-        _store.ReleaseExcept(usePending ? new[] { destination, pending } : new[] { destination });
+        // Own the destination first; without it, hold nothing at all, so the
+        // NINA that does own it can also take the pending queue.
         if (!destination.TryOwn())
         {
+            _store.ReleaseExcept();
             Publish(UploaderState.Paused, "another N.I.N.A. is sending this queue", UploadProblem.Busy);
             return KeyPause;
         }
+        if (pending.Count == 0 && pending.PinnedTo is not null)
+        {
+            pending.PinnedTo = null; // drained: the next key-less entries may go anywhere of this profile
+        }
+        // The pending queue only while it has something, only to the
+        // destination it went to first, and left to another NINA holding it.
+        var pin = pending.PinnedTo;
+        var usePending = pending.Count > 0
+            && (pin is null || pin == destination.Name)
+            && pending.TryOwn();
+        _store.ReleaseExcept(usePending ? new[] { destination, pending } : new[] { destination });
 
         FrameQueue queue;
         QueueEntry? entry;
@@ -537,6 +573,10 @@ public sealed class Uploader : IDisposable
         switch (outcome)
         {
             case Outcome.Ok:
+                if (queue == pending && pending.PinnedTo is null)
+                {
+                    pending.PinnedTo = destination.Name;
+                }
                 queue.Remove(entry);
                 _retry = FirstRetry;
                 _status = _status with { LastSent = _clock() };
@@ -616,6 +656,12 @@ public sealed class Uploader : IDisposable
                     return (Outcome.Ok, null);
                 }
                 var ended = await client.EndSessionAsync(state.Id, ct).ConfigureAwait(false);
+                if (ended.Outcome == Outcome.SessionGone && state.Misses == 0)
+                {
+                    // one 404 may be the proxy during a deploy: ask again before giving the session up
+                    sessions.PutSession(logical, state with { Misses = 1 }, now);
+                    return (Outcome.Retry, ended.Message);
+                }
                 if (ended.Outcome is Outcome.Ok or Outcome.SessionGone)
                 {
                     sessions.PutSession(
@@ -699,12 +745,19 @@ public sealed class Uploader : IDisposable
             if (sent.Outcome == Outcome.Ok)
             {
                 var last = captured > state.LastUsed ? captured : state.LastUsed;
-                sessions.PutSession(logical, state with { LastUsed = last, Accepted = true }, now);
+                sessions.PutSession(logical, state with { LastUsed = last, Accepted = true, Misses = 0 }, now);
                 return (sent.Outcome, sent.Message);
             }
             if (sent.Outcome != Outcome.SessionGone)
             {
                 return (sent.Outcome, sent.Message);
+            }
+            if (state.Accepted && state.Misses == 0)
+            {
+                // A session that took frames does not vanish for one 404: a
+                // proxy during a deploy does that. Ask again after the backoff.
+                sessions.PutSession(logical, state with { Misses = 1 }, now);
+                return (Outcome.Retry, sent.Message);
             }
             if (!state.Accepted && state.Replaced)
             {

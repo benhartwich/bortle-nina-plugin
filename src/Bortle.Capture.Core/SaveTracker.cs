@@ -66,6 +66,9 @@ public sealed class SaveTracker
         }
     }
 
+    /// <summary>One save is over (the image was written, or skipped).</summary>
+    public event Action? Finished;
+
     /// <summary>NINA wrote an image (ImageSaved) — call after the frame is queued.</summary>
     public void SaveFinished()
     {
@@ -77,6 +80,7 @@ public sealed class SaveTracker
             }
             _lastActivity = _clock();
         }
+        Finished?.Invoke();
     }
 
     public int InFlight

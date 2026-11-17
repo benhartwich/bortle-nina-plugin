@@ -39,6 +39,22 @@ Fixes from the N.I.N.A. plugin manifest review (isbeorn/nina.plugin.manifests#79
     sent (uploads off, no or wrong key, another N.I.N.A.).
   - A queue entry locked for a moment is retried; a damaged one is set aside
     and logged.
+- From a third review round:
+  - A night sent after days offline is still one session with its end
+    (session records are forgotten by when they were last sent, not captured).
+  - One 404 on a session that already took frames, or on its end, is asked
+    again after the backoff instead of abandoning the session (a proxy during
+    a deploy).
+  - The queue lock is taken destination first; a NINA that cannot send holds
+    nothing, so the profile's pending queue is never starved.
+  - An image still being saved when the next sequence starts is counted off
+    by the save itself (a snapshot or JPEG included) and expires after 6 min.
+  - Entry order survives the PC clock being stepped back.
+  - A queue folder deleted while N.I.N.A. runs is recreated; the upload loop
+    survives it and later frames are kept.
+  - The profile's pending queue stays with the first key that took from it.
+  - A held session end is held from the moment it is written and never stays
+    held after an error.
 - Entries left by 0.1.0.x in `%LOCALAPPDATA%\NINA\Bortle\queue` record no owner
   and are not sent; the status line and the log say how many there are.
 
