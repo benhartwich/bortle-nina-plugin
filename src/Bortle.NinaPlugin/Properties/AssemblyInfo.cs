@@ -5,8 +5,8 @@ using System.Runtime.InteropServices;
 // plugin's settings under this GUID.
 [assembly: Guid("6f1c2b8e-4d0a-4e5b-9a63-2b7c0d9e5a41")]
 
-[assembly: AssemblyVersion("0.1.1.0")]
-[assembly: AssemblyFileVersion("0.1.1.0")]
+[assembly: AssemblyVersion("0.1.2.0")]
+[assembly: AssemblyFileVersion("0.1.2.0")]
 
 // [MANDATORY] The name NINA shows — and the name Bortle looks for in
 // /application/plugins before it puts "Finish Bortle session" into a sequence
@@ -29,6 +29,8 @@ using System.Runtime.InteropServices;
 
 - Every frame NINA saves is uploaded in the background. A queue on disk keeps
   them through network loss and restarts; nothing is ever deleted on this PC.
+  Each NINA profile, server and key has its own queue: frames go only to the
+  account they were captured for, and switching uploads off holds the queue.
 - When the sequence ends, Bortle develops all nights of that target together,
   on the level you chose when planning (step by step, guarded, or automatic).
 - The ""Finish Bortle session"" instruction, placed last in the End area after

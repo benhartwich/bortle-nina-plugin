@@ -28,8 +28,16 @@ public static class StatusText
             UploadProblem.KeyMissing => $"{KeyMissing} (Optionen → Plugins → Bortle). Neuer Versuch in 30 s.",
             UploadProblem.KeyRejected => $"{KeyRejected}. Neuer Versuch in 30 s.",
             UploadProblem.Quota => $"Speicher des Kontos voll: {s.Message}",
+            UploadProblem.Disabled => "Übertragung in diesem Profil ausgeschaltet – die Warteschlange wartet.",
+            UploadProblem.Busy => "Eine andere N.I.N.A.-Instanz überträgt diese Warteschlange.",
             _ => s.Message,
         };
+        if (s.Elsewhere > 0)
+        {
+            // never sent with this profile's key: they wait for their own
+            var other = $"{s.Elsewhere} warten auf ein anderes Profil oder einen anderen Schlüssel";
+            detail = string.IsNullOrEmpty(detail) ? other : $"{detail}\n{other}";
+        }
         return string.IsNullOrEmpty(detail) ? line : $"{line}\n{detail}";
     }
 }

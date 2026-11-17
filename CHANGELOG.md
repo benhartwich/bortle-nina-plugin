@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.2.0
+
+Fixes from the N.I.N.A. plugin manifest review (isbeorn/nina.plugin.manifests#795):
+
+- **A backlog stays with its owner.** Entries are queued per N.I.N.A. profile,
+  server address and plugin key, and sent only while exactly those are active.
+  Before, one shared queue sent whatever was waiting with the *current*
+  settings, so an image queued for account A could reach account B's server
+  with B's key. Server sessions are kept per destination too.
+- **Two N.I.N.A. instances no longer lose each other's entries.** Entry names
+  carry a per-instance tag and are never overwritten, removal deletes exactly
+  the entry that was sent, and a cross-process lock lets one instance send a
+  queue at a time. (Only upload records were affected, never the FITS files.)
+- **"Upload to Bortle" off stops the backlog too**, also after a restart, not
+  only new frames.
+- **A delayed end closes its own session.** Every sequence gets a session name
+  when it starts; its start, frames and end carry it, so N.I.N.A.'s delayed
+  "sequence finished" can no longer close the next sequence's session.
+- Entries left by 0.1.0.x in `%LOCALAPPDATA%\NINA\Bortle\queue` record no owner
+  and are not sent; the plugin logs how many there are.
+
 ## 0.1.1.0
 
 - New panel *Bortle Livestream* for N.I.N.A.'s imaging tab: one button to

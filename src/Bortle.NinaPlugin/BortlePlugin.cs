@@ -68,7 +68,15 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         // retried, never waited on forever.
         var http = new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
         _client = new BortleClient(http, () => new ClientSettings(ServerUrl, PluginKey));
-        _uploader = new Uploader(new FrameQueue(dataDir), _client, new NinaLog(), saves: _saves);
+        // One queue per profile + server + key (QueueStore): what one account
+        // queued is never sent with another's key.
+        WarnAboutOldQueue(dataDir);
+        _uploader = new Uploader(
+            new QueueStore(Path.Combine(dataDir, "queues")),
+            _client,
+            () => new CaptureContext(ProfileId, new ClientSettings(ServerUrl, PluginKey), UploadEnabled),
+            new NinaLog(),
+            saves: _saves);
         _uploader.StatusChanged += OnUploaderStatus;
         Uploader = _uploader;
         Client = _client;
@@ -115,6 +123,33 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         {
             _options.SetValueBoolean(nameof(UploadEnabled), value);
             Raise();
+            // the switch also governs what is already queued
+            _uploader.SettingsChanged();
+        }
+    }
+
+    private string ProfileId => _profile.ActiveProfile?.Id.ToString() ?? "default";
+
+    /// <summary>
+    /// 0.1.0.x kept one queue for every profile, without its owner. Those
+    /// entries are not sent on a guess; say where they are.
+    /// </summary>
+    private static void WarnAboutOldQueue(string dataDir)
+    {
+        try
+        {
+            var old = Path.Combine(dataDir, "queue");
+            var left = Directory.Exists(old) ? Directory.GetFiles(old, "*.json").Length : 0;
+            if (left > 0)
+            {
+                Logger.Warning(
+                    $"Bortle: {left} entries from an older plugin version in {old} are not sent: "
+                    + "they do not record which profile and key they belong to");
+            }
+        }
+        catch (Exception e)
+        {
+            Logger.Error($"Bortle: could not look at the old queue: {e.Message}");
         }
     }
 

@@ -23,9 +23,25 @@ N.I.N.A.
    it to tonight's plan, which carries the develop level chosen while planning:
    step by step, guarded, or automatic.
 2. **N.I.N.A. saves a frame.** The plugin writes one small entry to its queue
-   (`%LOCALAPPDATA%\NINA\Bortle\queue`) and returns immediately. A background
-   task then streams the FITS file to Bortle. The file on this PC is never
-   changed or deleted.
+   and returns immediately. A background task then streams the FITS file to
+   Bortle. The file on this PC is never changed or deleted.
+
+   There is one queue per N.I.N.A. profile, server address and plugin key
+   (`%LOCALAPPDATA%\NINA\Bortle\queues\`). What was queued for one account
+   goes only to that account: after a switch of profile, server or key, the
+   old backlog waits until its own settings are active again, and the
+   settings page counts it. Frames saved before a profile had any key go to
+   the first key that same profile gets.
+
+   Each sequence gets its own session, named by the plugin when the sequence
+   starts, and its start, frames and end carry that name. A late end, or a
+   frame N.I.N.A. writes after the end, reaches its own session, never the
+   next sequence's.
+
+   *Upload to Bortle* off stops sending as well as queuing: a backlog stays on
+   disk, also across restarts, until it is switched on again. Two N.I.N.A.
+   instances never overwrite each other's entries, and only one of them sends
+   a given queue at a time.
 3. **Something fails.**
    - **Network or server down:** the frame stays at the head of the queue and
      is retried after 10 s, then doubling up to 5 min. The queue survives

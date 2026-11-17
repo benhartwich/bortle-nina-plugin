@@ -60,7 +60,8 @@ public sealed class LiveServerTests : IDisposable
         Assert.False(string.IsNullOrEmpty(hello.Value?.Owner));
 
         var log = new NullLog();
-        using var uploader = new Uploader(new FrameQueue(Path.Combine(_dir, "q")), client, log);
+        using var uploader = new Uploader(
+            new QueueStore(Path.Combine(_dir, "q")), client, () => new CaptureContext("e2e", new ClientSettings(url, key)), log);
         uploader.SequenceStarted("e2e");
         uploader.FrameSaved(Fits("E2E_0001.fits", "E2E Test"), "E2E Test");
         uploader.FrameSaved(Fits("E2E_0002.fits", "E2E Test"), null); // OBJECT names it
