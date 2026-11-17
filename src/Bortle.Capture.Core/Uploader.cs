@@ -53,25 +53,30 @@ public sealed record UploaderStatus(
 /// change or a connection test succeeds. Frames the server will never take
 /// are skipped and logged.
 ///
-/// Every decision about which server session an entry belongs to is made from
-/// when it was CAPTURED (<see cref="QueueEntry.Created"/>), never from when it
-/// happens to be sent: a night sent after an outage is the same night.
+/// It keeps no server state. Every entry names its sequence (an id the plugin
+/// makes when NINA starts one) and the server files it by that name, so a late
+/// end can only end its own sequence, a frame sent days later still finds its
+/// night, and a 404 never makes the plugin open anything.
 /// </summary>
 public sealed class Uploader : IDisposable
 {
-    /// <summary>The server closes a session after this long without a frame;
-    /// frames captured this far apart belong to different sessions.</summary>
+    /// <summary>Frames taken by hand this far apart are different nights.</summary>
     public static readonly TimeSpan SessionIdle = TimeSpan.FromHours(6);
 
     /// <summary>
-    /// A frame captured this long after its session ended still goes to that
-    /// session: NINA writes the last image of a sequence in the background,
-    /// after the sequence (and "Finish Bortle session") moved on.
+    /// A frame saved this long after its sequence ended, without an exposure
+    /// time to go by, still counts as that sequence's.
     /// </summary>
     public static readonly TimeSpan LateFrameWindow = TimeSpan.FromMinutes(30);
 
     /// <summary>A frame whose folder stays unreachable this long is given up.</summary>
     public static readonly TimeSpan UnreachableGiveUp = TimeSpan.FromDays(7);
+
+    /// <summary>
+    /// Slack when matching an exposure start against a sequence's start and end
+    /// (both from this PC's clock; NINA stamps the exposure as it begins).
+    /// </summary>
+    internal static readonly TimeSpan Skew = TimeSpan.FromSeconds(15);
 
     internal static readonly TimeSpan FirstRetry = TimeSpan.FromSeconds(10);
     internal static readonly TimeSpan MaxRetry = TimeSpan.FromMinutes(5);
@@ -80,9 +85,6 @@ public sealed class Uploader : IDisposable
 
     /// <summary>How often a profile with uploads switched off looks again (a wake cuts it short).</summary>
     internal static readonly TimeSpan DisabledPoll = TimeSpan.FromMinutes(1);
-
-    /// <summary>How often a held session end is looked at while NINA finishes saving.</summary>
-    internal static readonly TimeSpan HeldPoll = TimeSpan.FromSeconds(1);
 
     /// <summary>
     /// Quiet time after the last settings change before the uploader looks
@@ -104,27 +106,19 @@ public sealed class Uploader : IDisposable
     private readonly SaveTracker? _saves;
     private readonly SemaphoreSlim _wake = new(0);
     private readonly CancellationTokenSource _stop = new();
-    private readonly object _sessions = new();
+    private readonly object _sequences = new();
     private Timer? _settle;
     private bool _disposed;
     private Task? _loop;
     private TimeSpan _retry = FirstRetry;
     private UploaderStatus _status;
     private (FrameQueue Pending, FrameQueue? Destination)? _view;
+    private string? _lastSession;
 
-    // The logical session of the sequence running now, the one that ended
-    // last (a frame NINA saves just after the end still belongs to it), the
-    // one for frames taken outside any sequence, and the images still on their
-    // way to disk when the next sequence started (they are the previous one's).
-    private string? _current;
-    private (string Id, DateTimeOffset At)? _lastEnded;
+    // The sequences of this run, newest last: when each started and ended.
+    // A frame goes to the sequence its exposure began in.
+    private readonly List<(string Id, DateTimeOffset Start, DateTimeOffset? End)> _history = new();
     private (string Id, DateTimeOffset LastUsed)? _adhoc;
-    private (string Id, int Left, DateTimeOffset Until)? _carry;
-
-    // Session ends this process queued and still holds back until NINA has
-    // saved the sequence's last images. Persisted like any entry, so closing
-    // NINA meanwhile loses nothing: a new process does not hold them.
-    private readonly HashSet<string> _held = new();
 
     public event Action? StatusChanged;
 
@@ -146,23 +140,6 @@ public sealed class Uploader : IDisposable
         _status = new UploaderStatus(UploaderState.Stopped, 0, null, null, null, Legacy: store.LegacyCount);
         _store.Changed += Wake;
         _store.Damaged += OnDamaged;
-        if (_saves is not null) _saves.Finished += OnSaveFinished;
-    }
-
-
-    /// <summary>
-    /// Each save that ends uses up one image the previous sequence still had
-    /// on its way, whether it became a frame or not (a snapshot, a JPEG).
-    /// </summary>
-    private void OnSaveFinished()
-    {
-        lock (_sessions)
-        {
-            if (_carry is { } carry)
-            {
-                _carry = carry.Left > 1 ? (carry.Id, carry.Left - 1, carry.Until) : null;
-            }
-        }
     }
 
     public UploaderStatus Status => _status;
@@ -238,27 +215,24 @@ public sealed class Uploader : IDisposable
     // --- what NINA tells us ------------------------------------------------------
 
     /// <summary>
-    /// A sequence starts. It always gets its logical session, so frames and
-    /// the end find each other even when uploads are switched on mid-sequence;
-    /// only the start itself is not queued when <paramref name="queue"/> is false.
+    /// A sequence starts. It always gets its id, so its frames and its end find
+    /// each other even when uploads are switched on mid-sequence; only the
+    /// start itself is not queued when <paramref name="queue"/> is false.
     /// </summary>
     public void SequenceStarted(string? sequence, bool queue = true)
     {
         string session;
-        lock (_sessions)
+        var now = _clock();
+        lock (_sequences)
         {
-            // Images NINA is still writing were taken by the sequence before.
-            var previous = _current ?? _lastEnded?.Id;
-            var inFlight = _saves?.InFlight ?? 0;
-            _carry = previous is not null && inFlight > 0
-                ? (previous, inFlight, _clock() + SaveTracker.GiveUpAfter)
-                : null;
-            if (_current is { } unfinished)
+            // a sequence that never said it finished ends where the next begins
+            if (_history.Count > 0 && _history[^1].End is null)
             {
-                _lastEnded = (unfinished, _clock());
+                _history[^1] = _history[^1] with { End = now };
             }
             session = NewSession();
-            _current = session;
+            _history.Add((session, now, null));
+            if (_history.Count > 20) _history.RemoveAt(0);
         }
         if (queue)
         {
@@ -266,25 +240,34 @@ public sealed class Uploader : IDisposable
         }
     }
 
-    public void FrameSaved(string path, string? target) =>
-        Enqueue(EntryKind.Frame, SessionForFrame(), path, target);
+    /// <summary>
+    /// NINA saved a frame. <paramref name="exposureStart"/> (NINA's own stamp)
+    /// decides its sequence: an image NINA writes after the sequence ended, or
+    /// after the next one began, still goes to the one it was taken in.
+    /// </summary>
+    public void FrameSaved(string path, string? target, DateTimeOffset? exposureStart = null) =>
+        Enqueue(EntryKind.Frame, SequenceForFrame(exposureStart), path, target);
 
-    /// <summary>Queue the end of the sequence running now, at once (nothing running: a no-op entry).</summary>
+    /// <summary>
+    /// The running sequence finished: its end is queued at once (on disk, so
+    /// closing NINA now loses nothing). Frames NINA still writes afterwards
+    /// carry the same sequence id and the server files them with it.
+    /// </summary>
     public (FrameQueue Queue, QueueEntry Entry) SequenceFinished() => Enqueue(EntryKind.SessionEnd, TakeCurrent());
 
     /// <summary>
-    /// Report the end of the session once NINA has saved every image it still
-    /// had on its way and every frame before the end has gone, and wait for
-    /// that — at most <paramref name="timeout"/> for both together, and no
-    /// longer than the uploader can actually send. True when the end reached
-    /// the server. Otherwise the end stays queued and follows the frames later,
-    /// and an image saved after it still joins the session; nothing is lost.
+    /// "Finish Bortle session": queue the end now, then wait until NINA has
+    /// saved its last images and everything of this sequence has reached
+    /// Bortle — at most <paramref name="timeout"/>, and no longer than the
+    /// uploader can actually send. True when it all arrived; otherwise it
+    /// follows from the queue, nothing is lost.
     /// </summary>
     public async Task<bool> FinishSessionAsync(TimeSpan timeout, CancellationToken ct)
     {
         var deadline = _clock() + timeout;
-        var (queue, end) = await EndWhenSavedAsync(deadline, ct).ConfigureAwait(false);
-        while (queue.Contains(end.Entry))
+        var (queue, end) = SequenceFinished();
+        var settled = await WaitForSavesAsync(deadline, ct).ConfigureAwait(false);
+        while (end.Session is { } session ? queue.HasSession(session) : queue.Contains(end))
         {
             if (_clock() >= deadline)
             {
@@ -293,49 +276,19 @@ public sealed class Uploader : IDisposable
             if (_status.State == UploaderState.Paused)
             {
                 // Switched off, no key, wrong key, quota or another NINA:
-                // waiting would only hold the sequence. The end stays queued.
+                // waiting would only hold the sequence. It stays queued.
                 return false;
             }
             await Task.Delay(Poll, ct).ConfigureAwait(false);
         }
-        return end.Settled;
+        return settled;
     }
 
-    /// <summary>
-    /// NINA's own "sequence finished": the end is queued at once (so closing
-    /// NINA now loses nothing) but held back until its last images are saved
-    /// (at most <paramref name="timeout"/>), without holding NINA up. The
-    /// session is fixed now, so a delayed end never closes the next one.
-    /// </summary>
-    public async Task EndAfterSavesAsync(TimeSpan timeout, CancellationToken ct)
+    /// <summary>NINA's own "sequence finished": queue the end, at once.</summary>
+    public Task EndAfterSavesAsync(TimeSpan timeout, CancellationToken ct)
     {
-        await EndWhenSavedAsync(_clock() + timeout, ct).ConfigureAwait(false);
-    }
-
-    private async Task<(FrameQueue, (QueueEntry Entry, bool Settled))> EndWhenSavedAsync(
-        DateTimeOffset deadline, CancellationToken ct)
-    {
-        var session = TakeCurrent();
-        var queue = _store.For(_context());
-        var held = queue.Enqueue(
-            EntryKind.SessionEnd, _clock(), session, written: e => { lock (_held) _held.Add(e.Id); });
-        try
-        {
-            var settled = await WaitForSavesAsync(deadline, ct).ConfigureAwait(false);
-            // Behind the images saved meanwhile: queue it again at the tail,
-            // then drop the held copy. A crash in between leaves two ends of
-            // the same session; the second is a no-op.
-            var end = queue.Enqueue(EntryKind.SessionEnd, _clock(), session);
-            queue.Remove(held);
-            return (queue, (end, settled));
-        }
-        finally
-        {
-            // whatever happened (stopped, a disk error), it must never stay
-            // held: at worst it goes out where it stands
-            lock (_held) _held.Remove(held.Id);
-            Wake();
-        }
+        SequenceFinished();
+        return Task.CompletedTask;
     }
 
     private (FrameQueue, QueueEntry) Enqueue(
@@ -346,37 +299,39 @@ public sealed class Uploader : IDisposable
         return (queue, queue.Enqueue(kind, _clock(), session, path, target, sequence));
     }
 
-    /// <summary>End the running session: it becomes the "last ended" one.</summary>
+    /// <summary>End the running sequence and return its id (null: nothing running).</summary>
     private string? TakeCurrent()
     {
-        lock (_sessions)
+        lock (_sequences)
         {
-            var session = _current;
-            if (session is not null)
-            {
-                _current = null;
-                _lastEnded = (session, _clock());
-            }
-            return session;
+            if (_history.Count == 0 || _history[^1].End is not null) return null;
+            _history[^1] = _history[^1] with { End = _clock() };
+            return _history[^1].Id;
         }
     }
 
-    private string SessionForFrame()
+    private string SequenceForFrame(DateTimeOffset? exposureStart)
     {
-        lock (_sessions)
+        lock (_sequences)
         {
             var now = _clock();
-            if (_carry is { } carry && carry.Left > 0 && now <= carry.Until)
+            if (exposureStart is { } t)
             {
-                // an image the previous sequence took, written after this one
-                // began (OnSaveFinished counts it off)
-                return carry.Id;
+                // the newest sequence that was running when the exposure began
+                for (var i = _history.Count - 1; i >= 0; i--)
+                {
+                    var (id, start, end) = _history[i];
+                    if (start - Skew <= t && (end is null || t <= end + Skew)) return id;
+                }
             }
-            if (_current is { } current) return current;
-            if (_lastEnded is { } ended && now - ended.At <= LateFrameWindow) return ended.Id;
+            else if (_history.Count > 0)
+            {
+                var (id, _, end) = _history[^1];
+                if (end is null || now - end <= LateFrameWindow) return id;
+            }
             // A frame outside any sequence (taken by hand, or the plugin came
-            // up mid-night): one session for such frames until they pause for
-            // as long as the server keeps a session open.
+            // up mid-night): one id for such frames until they pause for as
+            // long as the server keeps a night open.
             if (_adhoc is not { } adhoc || now - adhoc.LastUsed > SessionIdle)
             {
                 adhoc = (NewSession(), now);
@@ -400,7 +355,7 @@ public sealed class Uploader : IDisposable
         {
             if (_clock() >= deadline)
             {
-                _log.Error($"Bortle: {_saves.InFlight} image(s) still being saved; ending the session anyway");
+                _log.Error($"Bortle: {_saves.InFlight} image(s) still being saved; finishing anyway");
                 return false;
             }
             await Task.Delay(Poll, ct).ConfigureAwait(false);
@@ -436,7 +391,6 @@ public sealed class Uploader : IDisposable
         }
         _store.Changed -= Wake;
         _store.Damaged -= OnDamaged;
-        if (_saves is not null) _saves.Finished -= OnSaveFinished;
         _store.Dispose(); // releases this process's drain locks
         _stop.Cancel();
         _stop.Dispose();
@@ -488,11 +442,11 @@ public sealed class Uploader : IDisposable
     /// Handle the next entry once. Returns how long to wait before the next
     /// step, or null to carry straight on. A wake cuts any wait short.
     ///
-    /// Only the active profile's queues are looked at, and of those only the
-    /// one for the server and key it has now plus what it queued before it had
-    /// a key, merged in the order things were captured. Everything else waits
-    /// for its own owner. This process holds the drain lock of exactly the
-    /// queues it is sending and lets go of every other.
+    /// Only the active profile's queues are looked at: the one for the server
+    /// and key it has now, plus what it queued before it had a key, merged in
+    /// the order things were captured. Everything else waits for its own
+    /// owner. This process holds the drain lock of exactly the queues it is
+    /// sending and lets go of every other.
     /// </summary>
     internal async Task<TimeSpan?> StepAsync(CancellationToken ct)
     {
@@ -521,25 +475,16 @@ public sealed class Uploader : IDisposable
             Publish(UploaderState.Paused, "Bortle server address or plugin key is missing", UploadProblem.KeyMissing);
             return KeyPause;
         }
-
-        // Own the destination first; without it, hold nothing at all, so the
-        // NINA that does own it can also take the pending queue.
+        // The destination first; without it hold nothing, so the NINA that
+        // owns it can also take the pending queue.
         if (!destination.TryOwn())
         {
             _store.ReleaseExcept();
             Publish(UploaderState.Paused, "another N.I.N.A. is sending this queue", UploadProblem.Busy);
             return KeyPause;
         }
-        if (pending.Count == 0 && pending.PinnedTo is not null)
-        {
-            pending.PinnedTo = null; // drained: the next key-less entries may go anywhere of this profile
-        }
-        // The pending queue only while it has something, only to the
-        // destination it went to first, and left to another NINA holding it.
-        var pin = pending.PinnedTo;
-        var usePending = pending.Count > 0
-            && (pin is null || pin == destination.Name)
-            && pending.TryOwn();
+        // the pending queue only while it has something, and left to a NINA holding it
+        var usePending = pending.Count > 0 && pending.TryOwn();
         _store.ReleaseExcept(usePending ? new[] { destination, pending } : new[] { destination });
 
         FrameQueue queue;
@@ -559,24 +504,11 @@ public sealed class Uploader : IDisposable
             Publish(UploaderState.Idle, null);
             return TimeSpan.FromMinutes(1);
         }
-        bool held;
-        lock (_held) held = _held.Contains(entry.Id);
-        if (held)
-        {
-            // the end waits for NINA's last images; they will queue behind it
-            Publish(UploaderState.Sending, "waiting for N.I.N.A. to finish saving");
-            return HeldPoll;
-        }
         Publish(UploaderState.Sending, Describe(entry));
-        var (outcome, message) = await HandleAsync(entry, destination, _client.With(context.Settings), ct)
-            .ConfigureAwait(false);
+        var (outcome, message) = await HandleAsync(entry, _client.With(context.Settings), ct).ConfigureAwait(false);
         switch (outcome)
         {
             case Outcome.Ok:
-                if (queue == pending && pending.PinnedTo is null)
-                {
-                    pending.PinnedTo = destination.Name;
-                }
                 queue.Remove(entry);
                 _retry = FirstRetry;
                 _status = _status with { LastSent = _clock() };
@@ -586,10 +518,6 @@ public sealed class Uploader : IDisposable
                 _log.Error($"Bortle upload: skipped {Describe(entry)}: {message}");
                 queue.Remove(entry);
                 Publish(UploaderState.Sending, $"skipped {Describe(entry)}: {message}");
-                return null;
-            case Outcome.SessionGone:
-                // The server forgot the session; the next step opens a new one
-                // for the same entry (HandleAsync bounds how often).
                 return null;
             case Outcome.KeyMissing:
                 Publish(UploaderState.Paused, message, UploadProblem.KeyMissing);
@@ -626,48 +554,58 @@ public sealed class Uploader : IDisposable
             : (destination, fromDestination);
     }
 
-    private async Task<(Outcome, string?)> HandleAsync(
-        QueueEntry entry, FrameQueue sessions, BortleClient client, CancellationToken ct)
+    private async Task<(Outcome, string?)> HandleAsync(QueueEntry entry, BortleClient client, CancellationToken ct)
     {
-        var now = _clock();
-        var captured = entry.Created;
-        var logical = entry.Session;
-        var state = logical is null ? null : sessions.GetSession(logical);
+        var session = entry.Session;
         switch (entry.Kind)
         {
             case EntryKind.SessionStart:
             {
-                var started = await client.StartSessionAsync(entry.Sequence, ct).ConfigureAwait(false);
-                if (started.Outcome == Outcome.Ok && started.Value is { } info && logical is not null)
+                if (session is null) return (Outcome.Ok, null);
+                var started = await client.StartSequenceAsync(session, entry.Sequence, ct).ConfigureAwait(false);
+                if (started.Outcome == Outcome.Ok && started.Value is { } info)
                 {
-                    sessions.PutSession(logical, new SessionState(info.Id, captured), now);
+                    _lastSession = info.Id;
                     _log.Info($"Bortle session {info.Id} (develop level {info.Level})");
                 }
                 return (started.Outcome, started.Message);
             }
             case EntryKind.Frame:
-                return await SendFrameAsync(entry, logical ?? NewSession(), state, sessions, client, ct)
+            {
+                if (entry.Path is null)
+                {
+                    return (Outcome.Drop, "no file");
+                }
+                if (!File.Exists(entry.Path))
+                {
+                    // Gone for good only when its folder is there and it is
+                    // not: a network share that dropped out takes the folder.
+                    var folder = System.IO.Path.GetDirectoryName(entry.Path);
+                    if (folder is not null && Directory.Exists(folder))
+                    {
+                        return (Outcome.Drop, "the file is gone");
+                    }
+                    if (_clock() - entry.Created > UnreachableGiveUp)
+                    {
+                        return (Outcome.Drop, $"its folder has been unreachable for {UnreachableGiveUp.TotalDays:0} days");
+                    }
+                    return (Outcome.Retry, $"folder not reachable: {folder}");
+                }
+                var sent = await client.PutFrameAsync(session ?? NewSession(), entry.Path, entry.Target, ct)
                     .ConfigureAwait(false);
+                if (sent.Outcome == Outcome.Ok && sent.Value?.Session is { } filedIn)
+                {
+                    _lastSession = filedIn;
+                }
+                return (sent.Outcome, sent.Message);
+            }
             case EntryKind.SessionEnd:
             {
-                if (logical is null || state is null || state.Ended is not null)
+                if (session is null) return (Outcome.Ok, null); // nothing was running
+                var ended = await client.EndSequenceAsync(session, ct).ConfigureAwait(false);
+                if (ended.Outcome == Outcome.Ok)
                 {
-                    // nothing running, never reached the server, or ended already
-                    return (Outcome.Ok, null);
-                }
-                var ended = await client.EndSessionAsync(state.Id, ct).ConfigureAwait(false);
-                if (ended.Outcome == Outcome.SessionGone && state.Misses == 0)
-                {
-                    // one 404 may be the proxy during a deploy: ask again before giving the session up
-                    sessions.PutSession(logical, state with { Misses = 1 }, now);
-                    return (Outcome.Retry, ended.Message);
-                }
-                if (ended.Outcome is Outcome.Ok or Outcome.SessionGone)
-                {
-                    sessions.PutSession(
-                        logical, ended.Outcome == Outcome.Ok ? state with { Ended = captured } : null, now);
-                    _log.Info($"Bortle session {state.Id} ended");
-                    return (Outcome.Ok, null);
+                    _log.Info($"Bortle: sequence {session} ended");
                 }
                 return (ended.Outcome, ended.Message);
             }
@@ -676,120 +614,14 @@ public sealed class Uploader : IDisposable
         }
     }
 
-    private async Task<(Outcome, string?)> SendFrameAsync(
-        QueueEntry entry, string logical, SessionState? state, FrameQueue sessions, BortleClient client,
-        CancellationToken ct)
-    {
-        var now = _clock();
-        var captured = entry.Created;
-        if (entry.Path is null)
-        {
-            return (Outcome.Drop, "no file");
-        }
-        if (!File.Exists(entry.Path))
-        {
-            // Gone for good only when its folder is there and it is not: a
-            // network share that dropped out takes the folder with it.
-            var folder = System.IO.Path.GetDirectoryName(entry.Path);
-            if (folder is not null && Directory.Exists(folder))
-            {
-                return (Outcome.Drop, "the file is gone");
-            }
-            if (now - captured > UnreachableGiveUp)
-            {
-                return (Outcome.Drop, $"its folder has been unreachable for {UnreachableGiveUp.TotalDays:0} days");
-            }
-            return (Outcome.Retry, $"folder not reachable: {folder}");
-        }
-
-        if (state is { Ended: { } endedAt })
-        {
-            if (captured - endedAt <= LateFrameWindow)
-            {
-                // Taken just after its session ended: it still belongs there.
-                var late = await client.PutFrameAsync(state.Id, entry.Path, entry.Target, ct).ConfigureAwait(false);
-                if (late.Outcome != Outcome.SessionGone)
-                {
-                    if (late.Outcome == Outcome.Ok)
-                    {
-                        _log.Info($"Bortle: {Describe(entry)} joined session {state.Id} after its end");
-                    }
-                    return (late.Outcome, late.Message);
-                }
-            }
-            state = null; // too late, or the server no longer knows it
-        }
-        else if (state is not null && captured - state.LastUsed > SessionIdle)
-        {
-            state = null; // a different night: the server has closed that one
-        }
-
-        // At most two server sessions per attempt: the one we have (or a new
-        // one), and one replacement if the server says it does not know it. A
-        // session refused at once although the server just made it means the
-        // route is broken (a proxy, a rule), not the session: back off rather
-        // than open a session per step.
-        for (var attempt = 0; attempt < 2; attempt++)
-        {
-            if (state is null)
-            {
-                var started = await client.StartSessionAsync(null, ct).ConfigureAwait(false);
-                if (started.Outcome != Outcome.Ok || started.Value is null)
-                {
-                    return (started.Outcome == Outcome.SessionGone ? Outcome.Retry : started.Outcome, started.Message);
-                }
-                state = new SessionState(started.Value.Id, captured);
-                sessions.PutSession(logical, state, now);
-            }
-            var sent = await client.PutFrameAsync(state.Id, entry.Path, entry.Target, ct).ConfigureAwait(false);
-            if (sent.Outcome == Outcome.Ok)
-            {
-                var last = captured > state.LastUsed ? captured : state.LastUsed;
-                sessions.PutSession(logical, state with { LastUsed = last, Accepted = true, Misses = 0 }, now);
-                return (sent.Outcome, sent.Message);
-            }
-            if (sent.Outcome != Outcome.SessionGone)
-            {
-                return (sent.Outcome, sent.Message);
-            }
-            if (state.Accepted && state.Misses == 0)
-            {
-                // A session that took frames does not vanish for one 404: a
-                // proxy during a deploy does that. Ask again after the backoff.
-                sessions.PutSession(logical, state with { Misses = 1 }, now);
-                return (Outcome.Retry, sent.Message);
-            }
-            if (!state.Accepted && state.Replaced)
-            {
-                // a replacement refused before it took a single frame
-                return (Outcome.Retry, $"the server refuses frames even in a new session: {sent.Message}");
-            }
-            var replaced = !state.Accepted;
-            state = null;
-            sessions.PutSession(logical, null, now);
-            if (replaced)
-            {
-                // the session we had never took a frame either; open one more, marked
-                var started = await client.StartSessionAsync(null, ct).ConfigureAwait(false);
-                if (started.Outcome != Outcome.Ok || started.Value is null)
-                {
-                    return (started.Outcome == Outcome.SessionGone ? Outcome.Retry : started.Outcome, started.Message);
-                }
-                state = new SessionState(started.Value.Id, captured, Replaced: true);
-                sessions.PutSession(logical, state, now);
-            }
-        }
-        return (Outcome.Retry, "the server refuses frames even in a new session");
-    }
-
     private void OnDamaged(string file) =>
         _log.Error($"Bortle: a damaged queue entry was set aside as {file}.bad");
 
     private static string Describe(QueueEntry entry) => entry.Kind switch
     {
         EntryKind.Frame => System.IO.Path.GetFileName(entry.Path ?? "?"),
-        EntryKind.SessionStart => "session start",
-        _ => "session end",
+        EntryKind.SessionStart => "sequence start",
+        _ => "sequence end",
     };
 
     private void Publish(UploaderState state, string? message, UploadProblem problem = UploadProblem.None)
@@ -801,7 +633,7 @@ public sealed class Uploader : IDisposable
             State = state,
             Waiting = waiting,
             Message = message,
-            SessionId = view?.Destination?.OpenSessionId(),
+            SessionId = _lastSession,
             Problem = problem,
             Elsewhere = view is { } w ? _store.CountExcept(w.Pending, w.Destination) : 0,
             Legacy = _store.LegacyCount,

@@ -14,7 +14,7 @@ public enum EntryKind
 /// <summary>One thing to tell Bortle, in the order NINA did it.</summary>
 public sealed record QueueEntry
 {
-    /// <summary>The entry's file name without ".json"; unique across processes.</summary>
+    /// <summary>The entry's file name without ".json"; unique across processes, sorts in capture order.</summary>
     public string Id { get; init; } = "";
     public EntryKind Kind { get; init; }
     public string? Path { get; init; }
@@ -23,34 +23,13 @@ public sealed record QueueEntry
     public DateTimeOffset Created { get; init; }
 
     /// <summary>
-    /// The logical session this entry belongs to: one per NINA sequence, made
-    /// by the plugin when the sequence starts, so a start, its frames and its
-    /// end always meet the same server session however late one of them is
-    /// sent. Null only for an end with nothing to end.
+    /// The sequence this entry belongs to: an id the plugin makes when a NINA
+    /// sequence starts (32 hex digits). Start, frames and end carry it, and the
+    /// server files them by it, so however late one of them is sent it reaches
+    /// its own night. Null only for an end with nothing to end.
     /// </summary>
     public string? Session { get; init; }
 }
-
-/// <summary>
-/// A server session the plugin opened for one logical session, when it was
-/// last used and, once ended, when.
-/// </summary>
-/// <remarks>
-/// <see cref="LastUsed"/> and <see cref="Ended"/> are CAPTURE times (when NINA
-/// made the entry), so a night sent late is judged as it happened.
-/// <see cref="Accepted"/>: the server has taken a frame into it.
-/// <see cref="Replaced"/>: opened because the server did not know the one before.
-/// <see cref="Misses"/>: 404s in a row; one is a passing proxy hiccup, not a lost session.
-/// <see cref="Touched"/>: when this process last wrote it (send time), for forgetting old ones.
-/// </remarks>
-public sealed record SessionState(
-    string Id,
-    DateTimeOffset LastUsed,
-    DateTimeOffset? Ended = null,
-    bool Accepted = false,
-    bool Replaced = false,
-    int Misses = 0,
-    DateTimeOffset? Touched = null);
 
 /// <summary>
 /// One owner's queue between NINA and the network, kept on disk.
@@ -59,36 +38,33 @@ public sealed record SessionState(
 /// that were active when the entries were made (see <see cref="QueueStore"/>):
 /// what was queued for one account is only ever sent to that account.
 ///
-/// Session starts, frames and session ends go through the same queue, so the
-/// server hears them in the order they happened. One small JSON file per entry,
-/// written to a temporary name and moved into place without overwriting, so a
-/// crash leaves either the whole entry or none of it, the queue survives NINA
-/// restarting, and two NINA instances writing to the same queue never replace
-/// or delete each other's entries: every name carries the writing process's tag.
+/// One small JSON file per entry, written to a temporary name and moved into
+/// place without overwriting, so a crash leaves either the whole entry or none
+/// of it, the queue survives NINA restarting, and two NINA instances writing to
+/// the same queue never replace or delete each other's entries: every name
+/// carries the writing queue object's tag.
 ///
 /// Sending is guarded across processes: only the instance holding the drain
-/// lock (<see cref="TryOwn"/>) sends from a queue and keeps its session map.
+/// lock (<see cref="TryOwn"/>) sends from a queue.
 /// </summary>
 public sealed class FrameQueue : IDisposable
 {
     /// <summary>
     /// Tells this queue object's entries apart from another's: each NINA
     /// process opens its own FrameQueue for a directory (QueueStore keeps one
-    /// per directory), so two processes never share a tag or a counter.
+    /// per directory), so two processes never share a tag.
     /// </summary>
     private readonly string Instance = Guid.NewGuid().ToString("N")[..12];
 
-    // One counter for the process: it orders entries of the same tick across
-    // this process's queues (a profile's pending queue and its destination).
+    // One counter and one clock floor for the process: entries of the same
+    // tick are ordered by the counter, and an id never sorts before one this
+    // process (or, from the disk, an earlier run) has already handed out, even
+    // when the PC's clock is stepped back.
     private static long s_counter;
-
-    // The newest tick handed out: a clock stepped back (NTP) must not sort a
-    // later entry before an earlier one.
     private static long s_lastTicks;
     private static readonly object s_order = new();
 
     private readonly string _dir;
-    private readonly string _sessionsFile;
     private readonly string _lockFile;
     private readonly object _lock = new();
     private FileStream? _drainLock;
@@ -102,9 +78,17 @@ public sealed class FrameQueue : IDisposable
     {
         Root = directory;
         _dir = System.IO.Path.Combine(directory, "queue");
-        _sessionsFile = System.IO.Path.Combine(directory, "sessions.json");
         _lockFile = System.IO.Path.Combine(directory, "drain.lock");
         Directory.CreateDirectory(_dir);
+        foreach (var file in Files())
+        {
+            // Continue after the newest entry already waiting: a clock that
+            // was ahead when it was written must not put tonight before it.
+            if (long.TryParse(System.IO.Path.GetFileName(file).Split('-')[0], out var ticks))
+            {
+                lock (s_order) s_lastTicks = Math.Max(s_lastTicks, ticks);
+            }
+        }
         // Temporary files a crash left behind; an entry is never a .tmp.
         foreach (var tmp in Directory.EnumerateFiles(_dir, "*.tmp"))
         {
@@ -115,39 +99,6 @@ public sealed class FrameQueue : IDisposable
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
             }
-        }
-    }
-
-    /// <summary>Entries set aside as damaged.</summary>
-    public int DamagedCount => Directory.Exists(_dir) ? Directory.EnumerateFiles(_dir, "*.bad").Count() : 0;
-
-    /// <summary>The folder name, which is the owner's (see <see cref="QueueStore"/>).</summary>
-    public string Name => System.IO.Path.GetFileName(Root);
-
-    /// <summary>
-    /// For a profile's pending queue: the destination that took its first
-    /// entry. The rest follow it there, so one sequence never ends up on two keys.
-    /// </summary>
-    public string? PinnedTo
-    {
-        get
-        {
-            try
-            {
-                var file = System.IO.Path.Combine(Root, "pinned.txt");
-                return File.Exists(file) ? File.ReadAllText(file).Trim() : null;
-            }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                return null;
-            }
-        }
-        set
-        {
-            var file = System.IO.Path.Combine(Root, "pinned.txt");
-            Directory.CreateDirectory(Root);
-            if (value is null) File.Delete(file);
-            else File.WriteAllText(file, value);
         }
     }
 
@@ -164,14 +115,16 @@ public sealed class FrameQueue : IDisposable
         }
     }
 
+    /// <summary>Entries set aside as damaged.</summary>
+    public int DamagedCount => Directory.Exists(_dir) ? Directory.EnumerateFiles(_dir, "*.bad").Count() : 0;
+
     public QueueEntry Enqueue(
         EntryKind kind,
         DateTimeOffset created,
         string? session,
         string? path = null,
         string? target = null,
-        string? sequence = null,
-        Action<QueueEntry>? written = null)
+        string? sequence = null)
     {
         QueueEntry entry;
         lock (_lock)
@@ -180,9 +133,6 @@ public sealed class FrameQueue : IDisposable
             Directory.CreateDirectory(_dir);
             while (true)
             {
-                // Time first, so the names sort in the order things happened;
-                // the counter orders entries made in the same tick, the tag
-                // keeps two processes from ever choosing the same name.
                 long ticks;
                 lock (s_order)
                 {
@@ -206,8 +156,6 @@ public sealed class FrameQueue : IDisposable
                 try
                 {
                     File.Move(tmp, final, overwrite: false);
-                    // before anyone is told: a held end must be held from its first moment
-                    written?.Invoke(entry);
                     break;
                 }
                 catch (IOException) when (File.Exists(final))
@@ -280,9 +228,28 @@ public sealed class FrameQueue : IDisposable
         }
     }
 
+    /// <summary>Whether any entry of this sequence is still waiting.</summary>
+    public bool HasSession(string session)
+    {
+        lock (_lock)
+        {
+            foreach (var file in Files())
+            {
+                try
+                {
+                    if (JsonSerializer.Deserialize<QueueEntry>(File.ReadAllText(file))?.Session == session) return true;
+                }
+                catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
+                {
+                }
+            }
+            return false;
+        }
+    }
+
     /// <summary>
     /// Become the one process that sends from this queue. Held until
-    /// <see cref="Dispose"/>; false while another NINA holds it.
+    /// <see cref="Release"/> or <see cref="Dispose"/>; false while another NINA holds it.
     /// </summary>
     public bool TryOwn()
     {
@@ -296,7 +263,7 @@ public sealed class FrameQueue : IDisposable
                     _lockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.None);
                 return true;
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
                 return false;
             }
@@ -313,74 +280,7 @@ public sealed class FrameQueue : IDisposable
         }
     }
 
-    public SessionState? GetSession(string logical)
-    {
-        lock (_lock)
-        {
-            return LoadSessions().TryGetValue(logical, out var state) ? state : null;
-        }
-    }
-
-    /// <summary>Remember (or, with null, forget) the server session of a logical session.</summary>
-    public void PutSession(string logical, SessionState? state, DateTimeOffset now)
-    {
-        lock (_lock)
-        {
-            var all = LoadSessions();
-            if (state is null) all.Remove(logical);
-            else all[logical] = state with { Touched = now };
-            // Forget what this process has not touched for days. By send time,
-            // never by capture time: a night sent after a week offline must
-            // still find its own session.
-            foreach (var key in all
-                         .Where(kv => kv.Key != logical && now - (kv.Value.Touched ?? kv.Value.LastUsed) > TimeSpan.FromDays(3))
-                         .Select(kv => kv.Key)
-                         .ToList())
-            {
-                all.Remove(key);
-            }
-            Directory.CreateDirectory(Root);
-            var tmp = _sessionsFile + "." + Instance + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(all));
-            File.Move(tmp, _sessionsFile, overwrite: true);
-        }
-    }
-
-    /// <summary>The server session used last that has not ended, for the status line.</summary>
-    public string? OpenSessionId()
-    {
-        lock (_lock)
-        {
-            return LoadSessions().Values
-                .Where(s => s.Ended is null)
-                .OrderByDescending(s => s.LastUsed)
-                .Select(s => s.Id)
-                .FirstOrDefault();
-        }
-    }
-
-    public void Dispose()
-    {
-        lock (_lock)
-        {
-            _drainLock?.Dispose();
-            _drainLock = null;
-        }
-    }
-
-    private Dictionary<string, SessionState> LoadSessions()
-    {
-        try
-        {
-            return File.Exists(_sessionsFile)
-                ? JsonSerializer.Deserialize<Dictionary<string, SessionState>>(File.ReadAllText(_sessionsFile)) ?? new()
-                : new();
-        }
-        catch (Exception e) when (e is JsonException or IOException)
-        {
-            return new();
-        }
-    }
+    public void Dispose() => Release();
 
     private string FileOf(string id) => System.IO.Path.Combine(_dir, id + ".json");
 
@@ -412,9 +312,9 @@ public sealed record CaptureContext(string ProfileId, ClientSettings Settings, b
 /// server when the settings or the profile change; it waits, counted in the
 /// status line, until its own profile and key are back.
 ///
-/// The one exception is a profile that had no key yet when it captured: those
-/// entries wait in the profile's "pending" queue and go to the first server and
-/// key that same profile is given — the owner is the profile, and the key
+/// The one exception is a profile that had no complete key when it captured:
+/// those entries wait in the profile's "pending" queue and go with the key that
+/// same profile has when they are sent — the owner is the profile, and a key
 /// arriving a moment late was the normal case (2026-11-12).
 /// </summary>
 public sealed class QueueStore : IDisposable
@@ -456,18 +356,6 @@ public sealed class QueueStore : IDisposable
         }
     }
 
-    /// <summary>Let go of the drain lock of every queue but these.</summary>
-    public void ReleaseExcept(params FrameQueue[] keep)
-    {
-        lock (_lock)
-        {
-            foreach (var queue in _queues.Values)
-            {
-                if (Array.IndexOf(keep, queue) < 0) queue.Release();
-            }
-        }
-    }
-
     public FrameQueue Pending(string profileId) => For("p-" + Hash(profileId));
 
     public FrameQueue Destination(string profileId, ClientSettings settings) =>
@@ -492,6 +380,18 @@ public sealed class QueueStore : IDisposable
             if (Directory.Exists(queue)) total += Directory.EnumerateFiles(queue, "*.json").Count();
         }
         return total;
+    }
+
+    /// <summary>Let go of the drain lock of every queue but these.</summary>
+    public void ReleaseExcept(params FrameQueue[] keep)
+    {
+        lock (_lock)
+        {
+            foreach (var queue in _queues.Values)
+            {
+                if (Array.IndexOf(keep, queue) < 0) queue.Release();
+            }
+        }
     }
 
     public void Dispose()

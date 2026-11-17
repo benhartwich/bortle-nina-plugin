@@ -2,59 +2,39 @@
 
 ## 0.1.2.0
 
-Fixes from the N.I.N.A. plugin manifest review (isbeorn/nina.plugin.manifests#795):
+Rebuilt after the N.I.N.A. plugin manifest review (isbeorn/nina.plugin.manifests#795)
+and three adversarial review rounds of our own. **Needs a Bortle server from
+2026-11 or later** (`/capture/hello` answers `"protocol": 2`); an older server
+answers 404, which the plugin retries with backoff and names in its status line.
 
-- **A backlog stays with its owner.** Entries are queued per N.I.N.A. profile,
-  server address and plugin key, and sent only while exactly those are active.
-  Before, one shared queue sent whatever was waiting with the *current*
-  settings, so an image queued for account A could reach account B's server
-  with B's key. Server sessions are kept per destination too.
-- **Two N.I.N.A. instances no longer lose each other's entries.** Entry names
-  carry a per-instance tag and are never overwritten, removal deletes exactly
-  the entry that was sent, and a cross-process lock lets one instance send a
-  queue at a time. (Only upload records were affected, never the FITS files.)
-- **"Upload to Bortle" off stops the backlog too**, also after a restart, not
-  only new frames.
-- **A delayed end closes its own session.** Every sequence gets a session name
-  when it starts; its start, frames and end carry it, so N.I.N.A.'s delayed
-  "sequence finished" can no longer close the next sequence's session.
-- From a second, adversarial review before release:
-  - A frame route that always answers 404 (a proxy rule) no longer opens a new
-    server session on every step: one replacement, then the usual backoff.
-  - A queue is held only while this N.I.N.A. sends it; a profile switch lets
-    another instance take it over, and an empty pending queue never blocks.
-  - Which session a frame belongs to is judged by when it was captured, not
-    when it is sent: a late frame or a long outage no longer splits a night.
-  - The last image of a sequence, still being written when the next sequence
-    starts, stays with its own sequence.
-  - Entries are sent in capture order across the queue for a key and the
-    profile's queue from before it had a key; a half-typed key (not yet
-    `bnp_` + 32 characters) does not count as a key.
-  - The session end is on disk at once and held back until N.I.N.A. has saved
-    the last images, so closing N.I.N.A. right after a sequence loses nothing.
-    Switching uploads on mid-sequence still ends that sequence's session.
-  - A frame on a folder that is not reachable (a network share offline) waits
-    instead of being dropped; given up after 7 days.
-  - "Finish Bortle session" no longer holds the sequence when nothing can be
-    sent (uploads off, no or wrong key, another N.I.N.A.).
-  - A queue entry locked for a moment is retried; a damaged one is set aside
-    and logged.
-- From a third review round:
-  - A night sent after days offline is still one session with its end
-    (session records are forgotten by when they were last sent, not captured).
-  - One 404 on a session that already took frames, or on its end, is asked
-    again after the backoff instead of abandoning the session (a proxy during
-    a deploy).
-  - The queue lock is taken destination first; a NINA that cannot send holds
-    nothing, so the profile's pending queue is never starved.
-  - An image still being saved when the next sequence starts is counted off
-    by the save itself (a snapshot or JPEG included) and expires after 6 min.
-  - Entry order survives the PC clock being stepped back.
-  - A queue folder deleted while N.I.N.A. runs is recreated; the upload loop
-    survives it and later frames are kept.
-  - The profile's pending queue stays with the first key that took from it.
-  - A held session end is held from the moment it is written and never stays
-    held after an error.
+- **Sequences are named by the plugin, filed by the server.** Every N.I.N.A.
+  sequence gets an id when it starts; its start, frames and end are sent to
+  `/capture/sequences/<id>/`. The server knows which night holds which
+  sequence, and a night ends only when the last of its sequences has ended.
+  The plugin keeps no server session state at all, so a late end can only end
+  its own sequence, a night sent days later is still one night, and a 404 is
+  never a reason to open anything.
+- **An image belongs to the sequence its exposure began in** (N.I.N.A.'s own
+  timestamp), however late it is written: after the end, or after the next
+  sequence started.
+- **A backlog stays with its owner.** Queues are per N.I.N.A. profile, server
+  address and plugin key, and sent only while exactly those are active, with
+  that key. Frames saved before a profile had any key go with the key that
+  same profile has when they are sent. A key is only a key when it is whole
+  (`bnp_` + 32 characters), so frames saved while one is being typed wait.
+- **Two N.I.N.A. instances** never overwrite each other's entries; one sends a
+  given queue at a time, and a N.I.N.A. that cannot send holds no lock.
+- **"Upload to Bortle" off stops the backlog too**, also after a restart.
+  Switching it on mid-sequence still ends that sequence.
+- **The end is on disk at once**: closing N.I.N.A. right after a sequence
+  loses nothing.
+- **Robust against the PC**: entries keep their order when the clock is
+  stepped back, also across a restart; a deleted queue folder is recreated and
+  the upload loop survives it; a frame on a network share that is offline
+  waits (up to 7 days) instead of being dropped; a locked entry is retried and
+  a damaged one set aside and logged.
+- **"Finish Bortle session"** no longer holds the sequence when nothing can be
+  sent (uploads off, no or wrong key, another N.I.N.A.).
 - Entries left by 0.1.0.x in `%LOCALAPPDATA%\NINA\Bortle\queue` record no owner
   and are not sent; the status line and the log say how many there are.
 

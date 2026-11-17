@@ -233,7 +233,13 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
                 }
                 return;
             }
-            _uploader.FrameSaved(path, e.MetaData?.Target?.Name);
+            // NINA's stamp of when the exposure began decides which sequence
+            // the image belongs to, however late it is written
+            var began = e.MetaData?.Image?.ExposureStart ?? default;
+            DateTimeOffset? exposureStart = began == default
+                ? null
+                : new DateTimeOffset(began.Kind == DateTimeKind.Utc ? began : began.ToUniversalTime());
+            _uploader.FrameSaved(path, e.MetaData?.Target?.Name, exposureStart);
         }
         catch (Exception ex)
         {
@@ -278,14 +284,11 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
     {
         try
         {
-            // NINA raises this right after the last instruction, while the
-            // last image is still being saved; end the session behind it. The
-            // end is queued even with uploads off: it is sent only once they
-            // are on again, and then closes what was sent.
-            _ = _uploader.EndAfterSavesAsync(TimeSpan.FromMinutes(10), CancellationToken.None)
-                .ContinueWith(
-                    t => Logger.Error($"Bortle: could not queue the session end: {t.Exception}"),
-                    TaskContinuationOptions.OnlyOnFaulted);
+            // Queued at once, so closing NINA now loses nothing. NINA may
+            // still be saving the last image: it carries the same sequence id
+            // (by its exposure time) and the server files it with the rest.
+            // Queued with uploads off too: it is sent only once they are on.
+            _uploader.SequenceFinished();
         }
         catch (Exception ex)
         {
