@@ -27,6 +27,10 @@ public enum UploadProblem
     KeyRejected,
     /// <summary>The account's storage is full.</summary>
     Quota,
+    /// <summary>Uploads are switched off in this profile; nothing is sent, the queue waits.</summary>
+    Disabled,
+    /// <summary>Another N.I.N.A. instance is sending this queue.</summary>
+    Busy,
 }
 
 public sealed record UploaderStatus(
@@ -35,7 +39,8 @@ public sealed record UploaderStatus(
     string? Message,
     DateTimeOffset? LastSent,
     string? SessionId,
-    UploadProblem Problem = UploadProblem.None);
+    UploadProblem Problem = UploadProblem.None,
+    int Elsewhere = 0);
 
 /// <summary>
 /// Sends the queue to Bortle, one entry after the other, in a background task.
@@ -81,33 +86,45 @@ public sealed class Uploader : IDisposable
 
     private Timer? _settle;
 
-    private readonly FrameQueue _queue;
+    private readonly QueueStore _store;
     private readonly BortleClient _client;
+    private readonly Func<CaptureContext> _context;
     private readonly ILog _log;
     private readonly Func<DateTimeOffset> _clock;
     private readonly SaveTracker? _saves;
     private readonly SemaphoreSlim _wake = new(0);
     private readonly CancellationTokenSource _stop = new();
+    private readonly object _sessions = new();
     private Task? _loop;
     private TimeSpan _retry = FirstRetry;
     private UploaderStatus _status;
 
+    // The logical session of the sequence running now, the one that ended
+    // last (a frame NINA saves just after the end still belongs to it), and
+    // the one for frames taken outside any sequence.
+    private string? _current;
+    private (string Id, DateTimeOffset At)? _lastEnded;
+    private (string Id, DateTimeOffset LastUsed)? _adhoc;
+
     public event Action? StatusChanged;
 
     public Uploader(
-        FrameQueue queue,
+        QueueStore store,
         BortleClient client,
+        Func<CaptureContext> context,
         ILog log,
         Func<DateTimeOffset>? clock = null,
         SaveTracker? saves = null)
     {
-        _queue = queue;
+        _store = store;
         _client = client;
+        _context = context;
         _log = log;
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
         _saves = saves;
-        _status = new UploaderStatus(UploaderState.Idle, queue.Count, null, null, queue.LoadSession()?.Id);
-        _queue.Changed += Wake;
+        // Not "Idle" before the loop has looked: nothing is known yet.
+        _status = new UploaderStatus(UploaderState.Stopped, 0, null, null, null);
+        _store.Changed += Wake;
     }
 
     public UploaderStatus Status => _status;
@@ -165,11 +182,36 @@ public sealed class Uploader : IDisposable
         }
     }
 
-    public void SequenceStarted(string? sequence) => _queue.Enqueue(EntryKind.SessionStart, sequence: sequence);
+    /// <summary>Entries waiting for the active profile and its server and key.</summary>
+    public int Waiting
+    {
+        get
+        {
+            var context = _context();
+            var pending = _store.Pending(context.ProfileId).Count;
+            return context.Settings.IsComplete
+                ? pending + _store.Destination(context.ProfileId, context.Settings).Count
+                : pending;
+        }
+    }
 
-    public void FrameSaved(string path, string? target) => _queue.Enqueue(EntryKind.Frame, path, target);
+    public void SequenceStarted(string? sequence)
+    {
+        string session;
+        lock (_sessions)
+        {
+            session = NewSession();
+            _current = session;
+            _lastEnded = null;
+        }
+        Enqueue(EntryKind.SessionStart, session, sequence: sequence);
+    }
 
-    public QueueEntry SequenceFinished() => _queue.Enqueue(EntryKind.SessionEnd);
+    public void FrameSaved(string path, string? target) =>
+        Enqueue(EntryKind.Frame, SessionForFrame(), path, target);
+
+    /// <summary>Queue the end of the sequence running now (nothing to end: a no-op entry).</summary>
+    public (FrameQueue Queue, QueueEntry Entry) SequenceFinished() => EnqueueEnd(TakeCurrent());
 
     /// <summary>
     /// Report the end of the session once NINA has saved every image it still
@@ -182,9 +224,12 @@ public sealed class Uploader : IDisposable
     public async Task<bool> FinishSessionAsync(TimeSpan timeout, CancellationToken ct)
     {
         var deadline = _clock() + timeout;
+        // The session is the one running NOW; whatever starts while we wait
+        // is another one and must not be ended by this.
+        var session = TakeCurrent();
         var settled = await WaitForSavesAsync(deadline, ct).ConfigureAwait(false);
-        var end = SequenceFinished();
-        while (_queue.HasPendingUpTo(end.Seq))
+        var (queue, end) = EnqueueEnd(session);
+        while (queue.Contains(end))
         {
             if (_clock() >= deadline)
             {
@@ -198,12 +243,60 @@ public sealed class Uploader : IDisposable
     /// <summary>
     /// NINA's own "sequence finished": queue the end once its last images are
     /// saved (at most <paramref name="timeout"/>), without holding NINA up.
+    /// The session is fixed now, so a delayed end never closes the next one.
     /// </summary>
     public async Task EndAfterSavesAsync(TimeSpan timeout, CancellationToken ct)
     {
+        var session = TakeCurrent();
         await WaitForSavesAsync(_clock() + timeout, ct).ConfigureAwait(false);
-        SequenceFinished();
+        EnqueueEnd(session);
     }
+
+    private (FrameQueue, QueueEntry) EnqueueEnd(string? session) => Enqueue(EntryKind.SessionEnd, session);
+
+    private (FrameQueue, QueueEntry) Enqueue(
+        EntryKind kind, string? session, string? path = null, string? target = null, string? sequence = null)
+    {
+        // The owner is fixed here, from the profile and settings active NOW.
+        var queue = _store.For(_context());
+        return (queue, queue.Enqueue(kind, _clock(), session, path, target, sequence));
+    }
+
+    /// <summary>End the running session: it becomes the "last ended" one.</summary>
+    private string? TakeCurrent()
+    {
+        lock (_sessions)
+        {
+            var session = _current;
+            if (session is not null)
+            {
+                _current = null;
+                _lastEnded = (session, _clock());
+            }
+            return session;
+        }
+    }
+
+    private string SessionForFrame()
+    {
+        lock (_sessions)
+        {
+            var now = _clock();
+            if (_current is { } current) return current;
+            if (_lastEnded is { } ended && now - ended.At <= LateFrameWindow) return ended.Id;
+            // A frame outside any sequence (taken by hand, or the plugin came
+            // up mid-night): one session for such frames until they pause for
+            // as long as the server keeps a session open.
+            if (_adhoc is not { } adhoc || now - adhoc.LastUsed > SessionIdle)
+            {
+                adhoc = (NewSession(), now);
+            }
+            _adhoc = (adhoc.Id, now);
+            return adhoc.Id;
+        }
+    }
+
+    private static string NewSession() => Guid.NewGuid().ToString("N");
 
     /// <summary>True when NINA settled before the deadline.</summary>
     private async Task<bool> WaitForSavesAsync(DateTimeOffset deadline, CancellationToken ct)
@@ -243,8 +336,9 @@ public sealed class Uploader : IDisposable
 
     public void Dispose()
     {
-        _queue.Changed -= Wake;
+        _store.Changed -= Wake;
         _settle?.Dispose();
+        _store.Dispose();
         _stop.Cancel();
         _stop.Dispose();
         _wake.Dispose();
@@ -287,34 +381,72 @@ public sealed class Uploader : IDisposable
     /// <summary>
     /// Handle the head of the queue once. Returns how long to wait before the
     /// next step, or null to carry straight on. A wake cuts any wait short.
+    ///
+    /// Only the active profile's queues are looked at, and of those only the
+    /// one for the server and key it has now (plus what it queued before it
+    /// had a key). Everything else waits for its own owner.
     /// </summary>
     internal async Task<TimeSpan?> StepAsync(CancellationToken ct)
     {
-        var entry = _queue.Peek();
+        var context = _context();
+        var pending = _store.Pending(context.ProfileId);
+        var destination = context.Settings.IsComplete
+            ? _store.Destination(context.ProfileId, context.Settings)
+            : null;
+        _view = (pending, destination);
+        if (!context.UploadEnabled)
+        {
+            // The switch governs sending, not only queuing: a backlog from
+            // before it was switched off stays where it is.
+            Publish(UploaderState.Paused, null, UploadProblem.Disabled);
+            return DisabledPoll;
+        }
+        if (destination is null)
+        {
+            if (pending.Count == 0)
+            {
+                Publish(UploaderState.Idle, null);
+                return TimeSpan.FromMinutes(1);
+            }
+            Publish(UploaderState.Paused, "Bortle server address or plugin key is missing", UploadProblem.KeyMissing);
+            return KeyPause;
+        }
+        if (!destination.TryOwn() || !pending.TryOwn())
+        {
+            Publish(UploaderState.Paused, "another N.I.N.A. is sending this queue", UploadProblem.Busy);
+            return KeyPause;
+        }
+        var queue = pending;
+        var entry = pending.Peek();
+        if (entry is null)
+        {
+            queue = destination;
+            entry = destination.Peek();
+        }
         if (entry is null)
         {
             Publish(UploaderState.Idle, null);
             return TimeSpan.FromMinutes(1);
         }
         Publish(UploaderState.Sending, Describe(entry));
-        var (outcome, message) = await HandleAsync(entry, ct).ConfigureAwait(false);
+        var (outcome, message) = await HandleAsync(entry, destination, _client.With(context.Settings), ct)
+            .ConfigureAwait(false);
         switch (outcome)
         {
             case Outcome.Ok:
-                _queue.Remove(entry);
+                queue.Remove(entry);
                 _retry = FirstRetry;
                 _status = _status with { LastSent = _clock() };
                 Publish(UploaderState.Sending, null);
                 return null;
             case Outcome.Drop:
                 _log.Error($"Bortle upload: skipped {Describe(entry)}: {message}");
-                _queue.Remove(entry);
+                queue.Remove(entry);
                 Publish(UploaderState.Sending, $"skipped {Describe(entry)}: {message}");
                 return null;
             case Outcome.SessionGone:
-                // The server forgot our session (or it was another install's):
-                // start a fresh one and send the same entry again.
-                _queue.SaveSession(null);
+                // The server forgot the session; the next step opens a new one
+                // for the same entry.
                 return null;
             case Outcome.KeyMissing:
                 Publish(UploaderState.Paused, message, UploadProblem.KeyMissing);
@@ -333,18 +465,25 @@ public sealed class Uploader : IDisposable
         }
     }
 
-    private async Task<(Outcome, string?)> HandleAsync(QueueEntry entry, CancellationToken ct)
+    /// <summary>How often a profile with uploads switched off looks again (a wake cuts it short).</summary>
+    internal static readonly TimeSpan DisabledPoll = TimeSpan.FromMinutes(1);
+
+    private (FrameQueue Pending, FrameQueue? Destination)? _view;
+
+    private async Task<(Outcome, string?)> HandleAsync(
+        QueueEntry entry, FrameQueue sessions, BortleClient client, CancellationToken ct)
     {
-        var session = _queue.LoadSession();
+        var now = _clock();
+        var logical = entry.Session;
+        var state = logical is null ? null : sessions.GetSession(logical);
         switch (entry.Kind)
         {
             case EntryKind.SessionStart:
             {
-                var started = await _client.StartSessionAsync(entry.Sequence, ct).ConfigureAwait(false);
-                if (started.Outcome == Outcome.Ok && started.Value is { } info)
+                var started = await client.StartSessionAsync(entry.Sequence, ct).ConfigureAwait(false);
+                if (started.Outcome == Outcome.Ok && started.Value is { } info && logical is not null)
                 {
-                    _queue.SaveSession(new SessionState(info.Id, _clock()));
-                    _queue.SaveEndedSession(null);
+                    sessions.PutSession(logical, new SessionState(info.Id, now), now);
                     _log.Info($"Bortle session {info.Id} (develop level {info.Level})");
                 }
                 return (started.Outcome, started.Message);
@@ -355,58 +494,69 @@ public sealed class Uploader : IDisposable
                 {
                     return (Outcome.Drop, "the file is gone");
                 }
-                if (session is null && _queue.LoadEndedSession() is { } ended)
+                if (logical is null)
                 {
-                    if (_clock() - ended.LastUsed <= LateFrameWindow)
+                    logical = NewSession(); // an entry from before sessions had names
+                }
+                if (state is { Ended: { } endedAt })
+                {
+                    if (now - endedAt <= LateFrameWindow)
                     {
                         // Saved after its session ended: it still belongs there.
-                        var late = await _client.PutFrameAsync(ended.Id, entry.Path, entry.Target, ct)
+                        var late = await client.PutFrameAsync(state.Id, entry.Path, entry.Target, ct)
                             .ConfigureAwait(false);
                         if (late.Outcome != Outcome.SessionGone)
                         {
                             if (late.Outcome == Outcome.Ok)
                             {
-                                _log.Info($"Bortle: {Describe(entry)} joined session {ended.Id} after its end");
+                                _log.Info($"Bortle: {Describe(entry)} joined session {state.Id} after its end");
                             }
                             return (late.Outcome, late.Message);
                         }
                     }
-                    _queue.SaveEndedSession(null); // too late, or the server no longer knows it
+                    state = null; // too late, or the server no longer knows it
                 }
-                if (session is null || _clock() - session.LastUsed > SessionIdle)
+                else if (state is not null && now - state.LastUsed > SessionIdle)
                 {
-                    // A frame without a sequence start (the plugin was installed
-                    // mid-night, or images were taken by hand), or last night's
-                    // session never ended: ask for tonight's.
-                    var started = await _client.StartSessionAsync(null, ct).ConfigureAwait(false);
+                    state = null; // the server has closed it by now
+                }
+                if (state is null)
+                {
+                    // No server session for this logical one (yet, or any more):
+                    // open one.
+                    var started = await client.StartSessionAsync(null, ct).ConfigureAwait(false);
                     if (started.Outcome != Outcome.Ok || started.Value is null)
                     {
                         return (started.Outcome == Outcome.SessionGone ? Outcome.Retry : started.Outcome,
                             started.Message);
                     }
-                    session = new SessionState(started.Value.Id, _clock());
-                    _queue.SaveSession(session);
+                    state = new SessionState(started.Value.Id, now);
+                    sessions.PutSession(logical, state, now);
                 }
-                var sent = await _client.PutFrameAsync(session.Id, entry.Path, entry.Target, ct).ConfigureAwait(false);
+                var sent = await client.PutFrameAsync(state.Id, entry.Path, entry.Target, ct).ConfigureAwait(false);
                 if (sent.Outcome == Outcome.Ok)
                 {
-                    _queue.SaveSession(session with { LastUsed = _clock() });
+                    sessions.PutSession(logical, state with { LastUsed = now }, now);
+                }
+                else if (sent.Outcome == Outcome.SessionGone)
+                {
+                    sessions.PutSession(logical, null, now);
                 }
                 return (sent.Outcome, sent.Message);
             }
             case EntryKind.SessionEnd:
             {
-                if (session is null)
+                if (logical is null || state is null || state.Ended is not null)
                 {
-                    return (Outcome.Ok, null); // ended already (the instruction, then NINA's own event)
+                    // nothing running, never reached the server, or ended already
+                    return (Outcome.Ok, null);
                 }
-                var ended = await _client.EndSessionAsync(session.Id, ct).ConfigureAwait(false);
+                var ended = await client.EndSessionAsync(state.Id, ct).ConfigureAwait(false);
                 if (ended.Outcome is Outcome.Ok or Outcome.SessionGone)
                 {
-                    _queue.SaveSession(null);
-                    _queue.SaveEndedSession(
-                        ended.Outcome == Outcome.Ok ? new SessionState(session.Id, _clock()) : null);
-                    _log.Info($"Bortle session {session.Id} ended");
+                    sessions.PutSession(
+                        logical, ended.Outcome == Outcome.Ok ? state with { Ended = now } : null, now);
+                    _log.Info($"Bortle session {state.Id} ended");
                     return (Outcome.Ok, null);
                 }
                 return (ended.Outcome, ended.Message);
@@ -425,13 +575,16 @@ public sealed class Uploader : IDisposable
 
     private void Publish(UploaderState state, string? message, UploadProblem problem = UploadProblem.None)
     {
+        var view = _view;
+        var waiting = view is { } v ? v.Pending.Count + (v.Destination?.Count ?? 0) : 0;
         _status = _status with
         {
             State = state,
-            Waiting = _queue.Count,
+            Waiting = waiting,
             Message = message,
-            SessionId = _queue.LoadSession()?.Id,
+            SessionId = view?.Destination?.OpenSessionId(),
             Problem = problem,
+            Elsewhere = view is { } w ? _store.CountExcept(w.Pending, w.Destination) : 0,
         };
         StatusChanged?.Invoke();
     }

@@ -57,17 +57,28 @@ public sealed class UploaderTests : IDisposable
     private readonly NullLog _log = new();
     private DateTimeOffset _now = new(2026, 10, 12, 20, 0, 0, TimeSpan.Zero);
     private ClientSettings _settings = new("https://bortle.example/", "bnp_secret");
+    private string _profile = "profile-a";
+    private bool _enabled = true;
+
+    private CaptureContext Context() => new(_profile, _settings, _enabled);
+
+    /// <summary>What the active profile still has to send.</summary>
+    private sealed class Waiting(Uploader uploader)
+    {
+        public int Count => uploader.Waiting;
+    }
 
     public void Dispose()
     {
         if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
     }
 
-    private (FrameQueue, Uploader) Make()
+    private (Waiting, Uploader) Make(SaveTracker? saves = null)
     {
-        var queue = new FrameQueue(_dir);
-        var client = new BortleClient(new HttpClient(_server), () => _settings);
-        return (queue, new Uploader(queue, client, _log, () => _now));
+        // the client's own settings are never what the uploader sends with
+        var client = new BortleClient(new HttpClient(_server), () => new ClientSettings("https://wrong.example/", "bnp_wrong"));
+        var uploader = new Uploader(new QueueStore(Path.Combine(_dir, "queues")), client, Context, _log, () => _now, saves);
+        return (new Waiting(uploader), uploader);
     }
 
     private string Frame(string name, int size = 2880)
@@ -110,7 +121,7 @@ public sealed class UploaderTests : IDisposable
         Assert.All(_server.Calls, c => Assert.Equal("Bearer bnp_secret", c.Auth));
         Assert.Equal(5760, _server.Calls[1].Bytes); // the whole file, streamed
         Assert.Equal(0, queue.Count);
-        Assert.Null(queue.LoadSession());
+        Assert.Null(uploader.Status.SessionId); // ended
     }
 
     [Fact]
@@ -332,7 +343,6 @@ public sealed class UploaderTests : IDisposable
 
         var (queue, again) = Make();
         Assert.Equal(1, queue.Count);
-        Assert.Equal("s1", queue.LoadSession()?.Id);
         await Drain(again);
         Assert.Equal("PUT /capture/sessions/s1/frames/a.fits", $"{_server.Calls[^1].Method} {_server.Calls[^1].Path}");
     }
@@ -413,12 +423,8 @@ public sealed class UploaderTests : IDisposable
         // 2026-11-12: Finish ended the session at 20:42:51, NINA wrote the
         // 5 s dark at 20:43:04, and the frame opened a session of its own.
         var saves = new SaveTracker(() => _now);
-        var queue = new FrameQueue(_dir);
-        var uploader = new Uploader(
-            queue, new BortleClient(new HttpClient(_server), () => _settings), _log, () => _now, saves)
-        {
-            Poll = TimeSpan.FromMilliseconds(5),
-        };
+        var (_, uploader) = Make(saves);
+        uploader.Poll = TimeSpan.FromMilliseconds(5);
         uploader.SequenceStarted(null);
         uploader.Start();
         try
@@ -459,7 +465,7 @@ public sealed class UploaderTests : IDisposable
         await Drain(uploader);
         Assert.Equal("/capture/sessions/s1/frames/late.fits", _server.Calls[^1].Path);
         Assert.Single(_server.Calls, c => c.Path == "/capture/sessions");
-        Assert.Null(queue.LoadSession()); // the session stays ended
+        Assert.Null(uploader.Status.SessionId); // the session stays ended
     }
 
     [Fact]
@@ -488,7 +494,6 @@ public sealed class UploaderTests : IDisposable
         Assert.Equal("/capture/sessions/s1/frames/late.fits", _server.Calls[^3].Path);
         Assert.Equal("/capture/sessions", _server.Calls[^2].Path);
         Assert.Equal("/capture/sessions/s2/frames/late.fits", _server.Calls[^1].Path);
-        Assert.Null(queue.LoadEndedSession());
         Assert.Equal(0, queue.Count);
     }
 
@@ -501,7 +506,6 @@ public sealed class UploaderTests : IDisposable
         uploader.SequenceStarted(null);
         uploader.FrameSaved(Frame("a.fits"), null);
         await Drain(uploader);
-        Assert.Null(queue.LoadEndedSession());
         Assert.Equal("/capture/sessions/s2/frames/a.fits", _server.Calls[^1].Path);
     }
 

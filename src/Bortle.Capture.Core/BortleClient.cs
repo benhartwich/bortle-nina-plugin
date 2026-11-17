@@ -105,6 +105,13 @@ public sealed class BortleClient
         _settings = settings;
     }
 
+    /// <summary>
+    /// The same client pinned to these settings: the uploader sends every
+    /// entry to the destination it was queued for, never to whatever the
+    /// profile says by the time the request goes out.
+    /// </summary>
+    public BortleClient With(ClientSettings settings) => new(_http, () => settings);
+
     public Task<ApiResult<Hello>> HelloAsync(CancellationToken ct) =>
         SendAsync<Hello>(HttpMethod.Get, "capture/hello", null, ct);
 
