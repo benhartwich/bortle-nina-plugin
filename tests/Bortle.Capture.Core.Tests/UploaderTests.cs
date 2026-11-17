@@ -171,10 +171,12 @@ public sealed class UploaderTests : IDisposable
         first.SequenceStarted("M42");
         first.FrameSaved(Frame("a.fits"), null);
         first.Dispose();
-        var again = Make();
-        Assert.Equal(2, again.Waiting);
+        var again = Make(); // NINA never said the sequence finished: the new run ends it
+        Assert.Equal(3, again.Waiting);
         await Drain(again);
-        Assert.Equal(new[] { "POST /capture/sequences/q1/start", "PUT /capture/sequences/q1/frames/a.fits" }, _server.Wire);
+        Assert.Equal(
+            new[] { "POST /capture/sequences/q1/start", "PUT /capture/sequences/q1/frames/a.fits", "POST /capture/sequences/q1/end" },
+            _server.Wire);
     }
 
     [Fact]
@@ -472,6 +474,61 @@ public sealed class UploaderTests : IDisposable
         Assert.Single(_server.Wire, c => c.EndsWith("/end"));
     }
 
+    [Fact]
+    public async Task A_sequence_that_never_said_it_finished_is_ended_when_the_next_starts()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("a.fits"), null);
+        u.SequenceStarted("B"); // NINA started B without finishing A
+        u.FrameSaved(Frame("b.fits"), null);
+        u.SequenceFinished();
+        await Drain(u);
+        Assert.Contains("POST /capture/sequences/q1/end", _server.Wire);
+        Assert.Equal("POST /capture/sequences/q2/end", _server.Wire[^1]);
+    }
+
+    [Fact]
+    public async Task The_sequence_running_when_NINA_stopped_is_ended_by_the_next_run()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("a.fits"), null);
+        u.Dispose(); // NINA crashed: no SequenceFinished
+        var again = Make();
+        await Drain(again);
+        Assert.Equal("POST /capture/sequences/q1/end", _server.Wire[^1]);
+        again.Dispose();
+        var third = Make(); // and only once
+        await Drain(third);
+        Assert.Single(_server.Wire, c => c.EndsWith("/end"));
+    }
+
+    [Fact]
+    public async Task Frames_after_a_finish_instruction_mid_sequence_get_their_own_sequence()
+    {
+        var u = Make();
+        u.SequenceStarted("seq");
+        u.FrameSaved(Frame("1.fits"), null, _now);
+        _now += TimeSpan.FromMinutes(1);
+        await u.FinishSessionAsync(TimeSpan.Zero, CancellationToken.None); // the instruction, mid-sequence
+        _now += TimeSpan.FromMinutes(5);
+        u.FrameSaved(Frame("2.fits"), null, _now); // NINA carries on
+        await u.EndAfterSavesAsync(TimeSpan.Zero, CancellationToken.None); // NINA's own finish
+        await Drain(u);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/1.fits",
+                "POST /capture/sequences/q1/end",
+                "POST /capture/sequences/q2/start",
+                "PUT /capture/sequences/q2/frames/2.fits",
+                "POST /capture/sequences/q2/end",
+            },
+            _server.Wire);
+    }
+
     // --- crashes, restarts, the PC itself ---------------------------------------------
 
     [Fact]
@@ -522,6 +579,7 @@ public sealed class UploaderTests : IDisposable
             {
                 "POST /capture/sequences/q1/start",
                 "PUT /capture/sequences/q1/frames/A1.fits",
+                "POST /capture/sequences/q1/end", // A never finished: ended by the new run
                 "POST /capture/sequences/q2/start",
                 "PUT /capture/sequences/q2/frames/B1.fits",
             },

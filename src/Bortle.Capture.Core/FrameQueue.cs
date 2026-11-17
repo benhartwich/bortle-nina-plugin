@@ -104,6 +104,9 @@ public sealed class FrameQueue : IDisposable
 
     public string Root { get; }
 
+    /// <summary>The folder name, which is the owner's (see <see cref="QueueStore"/>).</summary>
+    public string Name => System.IO.Path.GetFileName(Root);
+
     public int Count
     {
         get
@@ -357,6 +360,48 @@ public sealed class QueueStore : IDisposable
     }
 
     public FrameQueue Pending(string profileId) => For("p-" + Hash(profileId));
+
+    /// <summary>A queue by its folder name (what <see cref="FrameQueue.Name"/> gave).</summary>
+    public FrameQueue ByName(string name) =>
+        System.Text.RegularExpressions.Regex.IsMatch(name, "^[pd]-[0-9a-f]{20}$")
+            ? For(name)
+            : throw new ArgumentException($"not a queue name: {name}");
+
+    /// <summary>
+    /// The sequence NINA is running, kept on disk: if NINA stops without
+    /// saying the sequence finished, the next start of the plugin ends it.
+    /// </summary>
+    public (string Id, string Queue)? Running
+    {
+        get
+        {
+            try
+            {
+                var file = System.IO.Path.Combine(_root, "running.txt");
+                if (!File.Exists(file)) return null;
+                var parts = File.ReadAllText(file).Trim().Split(' ');
+                return parts.Length == 2 ? (parts[0], parts[1]) : null;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                return null;
+            }
+        }
+        set
+        {
+            try
+            {
+                var file = System.IO.Path.Combine(_root, "running.txt");
+                Directory.CreateDirectory(_root);
+                if (value is { } v) File.WriteAllText(file, $"{v.Id} {v.Queue}");
+                else File.Delete(file);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                // best effort: at worst the server's idle sweep ends that night
+            }
+        }
+    }
 
     public FrameQueue Destination(string profileId, ClientSettings settings) =>
         For("d-" + Hash(profileId, Normalize(settings.ServerUrl), settings.Key.Trim()));

@@ -27,7 +27,10 @@ answers 404, which the plugin retries with backoff and names in its status line.
 - **"Upload to Bortle" off stops the backlog too**, also after a restart.
   Switching it on mid-sequence still ends that sequence.
 - **The end is on disk at once**: closing N.I.N.A. right after a sequence
-  loses nothing.
+  loses nothing. A sequence that never said it finished (N.I.N.A. started the
+  next one, or crashed) is ended by the next start or the next run.
+  "Finish Bortle session" placed mid-sequence ends Bortle's sequence; frames
+  N.I.N.A. takes after it form a sequence of their own.
 - **Robust against the PC**: entries keep their order when the clock is
   stepped back, also across a restart; a deleted queue folder is recreated and
   the upload loop survives it; a frame on a network share that is offline

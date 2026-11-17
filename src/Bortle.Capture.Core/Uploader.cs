@@ -120,6 +120,10 @@ public sealed class Uploader : IDisposable
     private readonly List<(string Id, DateTimeOffset Start, DateTimeOffset? End)> _history = new();
     private (string Id, DateTimeOffset LastUsed)? _adhoc;
 
+    // NINA's own sequence is still running (its SequenceFinished not seen yet),
+    // even when "Finish Bortle session" already ended Bortle's sequence.
+    private bool _ninaRunning;
+
     public event Action? StatusChanged;
 
     public Uploader(
@@ -140,6 +144,28 @@ public sealed class Uploader : IDisposable
         _status = new UploaderStatus(UploaderState.Stopped, 0, null, null, null, Legacy: store.LegacyCount);
         _store.Changed += Wake;
         _store.Damaged += OnDamaged;
+        EndOrphan();
+    }
+
+    /// <summary>
+    /// The sequence the last run was in when NINA stopped without saying it
+    /// finished (a crash, a restart): end it now, so its night does not wait
+    /// for the server's idle sweep.
+    /// </summary>
+    private void EndOrphan()
+    {
+        try
+        {
+            if (_store.Running is { } orphan)
+            {
+                _store.ByName(orphan.Queue).Enqueue(EntryKind.SessionEnd, _clock(), orphan.Id);
+                _store.Running = null;
+            }
+        }
+        catch (Exception e)
+        {
+            _log.Error($"Bortle: could not end the sequence of the last run: {e.Message}");
+        }
     }
 
     public UploaderStatus Status => _status;
@@ -221,23 +247,41 @@ public sealed class Uploader : IDisposable
     /// </summary>
     public void SequenceStarted(string? sequence, bool queue = true)
     {
-        string session;
-        var now = _clock();
+        string? unfinished = null;
         lock (_sequences)
         {
             // a sequence that never said it finished ends where the next begins
             if (_history.Count > 0 && _history[^1].End is null)
             {
-                _history[^1] = _history[^1] with { End = now };
+                _history[^1] = _history[^1] with { End = _clock() };
+                unfinished = _history[^1].Id;
             }
+            _ninaRunning = true;
+        }
+        if (unfinished is not null)
+        {
+            Enqueue(EntryKind.SessionEnd, unfinished);
+        }
+        Begin(sequence, queue);
+    }
+
+    /// <summary>A new sequence id: remembered (also on disk) and its start queued.</summary>
+    private string Begin(string? sequence, bool queue)
+    {
+        string session;
+        lock (_sequences)
+        {
             session = NewSession();
-            _history.Add((session, now, null));
+            _history.Add((session, _clock(), null));
             if (_history.Count > 20) _history.RemoveAt(0);
         }
+        var target = _store.For(_context());
+        _store.Running = (session, target.Name);
         if (queue)
         {
-            Enqueue(EntryKind.SessionStart, session, sequence: sequence);
+            target.Enqueue(EntryKind.SessionStart, _clock(), session, sequence: sequence);
         }
+        return session;
     }
 
     /// <summary>
@@ -245,15 +289,28 @@ public sealed class Uploader : IDisposable
     /// decides its sequence: an image NINA writes after the sequence ended, or
     /// after the next one began, still goes to the one it was taken in.
     /// </summary>
-    public void FrameSaved(string path, string? target, DateTimeOffset? exposureStart = null) =>
-        Enqueue(EntryKind.Frame, SequenceForFrame(exposureStart), path, target);
+    public void FrameSaved(string path, string? target, DateTimeOffset? exposureStart = null)
+    {
+        var session = SequenceForFrame(exposureStart);
+        if (session is null)
+        {
+            // "Finish Bortle session" stood mid-sequence and NINA carries on:
+            // what follows is a sequence of its own, ended by NINA's finish
+            session = Begin(null, queue: true);
+        }
+        Enqueue(EntryKind.Frame, session, path, target);
+    }
 
     /// <summary>
     /// The running sequence finished: its end is queued at once (on disk, so
     /// closing NINA now loses nothing). Frames NINA still writes afterwards
     /// carry the same sequence id and the server files them with it.
     /// </summary>
-    public (FrameQueue Queue, QueueEntry Entry) SequenceFinished() => Enqueue(EntryKind.SessionEnd, TakeCurrent());
+    public (FrameQueue Queue, QueueEntry Entry) SequenceFinished()
+    {
+        lock (_sequences) _ninaRunning = false; // NINA's own finish
+        return Enqueue(EntryKind.SessionEnd, TakeCurrent());
+    }
 
     /// <summary>
     /// "Finish Bortle session": queue the end now, then wait until NINA has
@@ -265,7 +322,8 @@ public sealed class Uploader : IDisposable
     public async Task<bool> FinishSessionAsync(TimeSpan timeout, CancellationToken ct)
     {
         var deadline = _clock() + timeout;
-        var (queue, end) = SequenceFinished();
+        // the instruction ends Bortle's sequence; NINA's may still go on
+        var (queue, end) = Enqueue(EntryKind.SessionEnd, TakeCurrent());
         var settled = await WaitForSavesAsync(deadline, ct).ConfigureAwait(false);
         while (end.Session is { } session ? queue.HasSession(session) : queue.Contains(end))
         {
@@ -302,15 +360,22 @@ public sealed class Uploader : IDisposable
     /// <summary>End the running sequence and return its id (null: nothing running).</summary>
     private string? TakeCurrent()
     {
+        string id;
         lock (_sequences)
         {
             if (_history.Count == 0 || _history[^1].End is not null) return null;
             _history[^1] = _history[^1] with { End = _clock() };
-            return _history[^1].Id;
+            id = _history[^1].Id;
         }
+        if (_store.Running is { } running && running.Id == id)
+        {
+            _store.Running = null;
+        }
+        return id;
     }
 
-    private string SequenceForFrame(DateTimeOffset? exposureStart)
+    /// <summary>The sequence of a frame; null when NINA carries on after "Finish Bortle session".</summary>
+    private string? SequenceForFrame(DateTimeOffset? exposureStart)
     {
         lock (_sequences)
         {
@@ -327,7 +392,11 @@ public sealed class Uploader : IDisposable
             else if (_history.Count > 0)
             {
                 var (id, _, end) = _history[^1];
-                if (end is null || now - end <= LateFrameWindow) return id;
+                if (end is null || (now - end <= LateFrameWindow && !_ninaRunning)) return id;
+            }
+            if (_ninaRunning && _history.Count > 0 && _history[^1].End is not null)
+            {
+                return null; // taken after Bortle's end, in a NINA sequence that goes on
             }
             // A frame outside any sequence (taken by hand, or the plugin came
             // up mid-night): one id for such frames until they pause for as
