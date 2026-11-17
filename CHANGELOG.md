@@ -18,8 +18,29 @@ Fixes from the N.I.N.A. plugin manifest review (isbeorn/nina.plugin.manifests#79
 - **A delayed end closes its own session.** Every sequence gets a session name
   when it starts; its start, frames and end carry it, so N.I.N.A.'s delayed
   "sequence finished" can no longer close the next sequence's session.
+- From a second, adversarial review before release:
+  - A frame route that always answers 404 (a proxy rule) no longer opens a new
+    server session on every step: one replacement, then the usual backoff.
+  - A queue is held only while this N.I.N.A. sends it; a profile switch lets
+    another instance take it over, and an empty pending queue never blocks.
+  - Which session a frame belongs to is judged by when it was captured, not
+    when it is sent: a late frame or a long outage no longer splits a night.
+  - The last image of a sequence, still being written when the next sequence
+    starts, stays with its own sequence.
+  - Entries are sent in capture order across the queue for a key and the
+    profile's queue from before it had a key; a half-typed key (not yet
+    `bnp_` + 32 characters) does not count as a key.
+  - The session end is on disk at once and held back until N.I.N.A. has saved
+    the last images, so closing N.I.N.A. right after a sequence loses nothing.
+    Switching uploads on mid-sequence still ends that sequence's session.
+  - A frame on a folder that is not reachable (a network share offline) waits
+    instead of being dropped; given up after 7 days.
+  - "Finish Bortle session" no longer holds the sequence when nothing can be
+    sent (uploads off, no or wrong key, another N.I.N.A.).
+  - A queue entry locked for a moment is retried; a damaged one is set aside
+    and logged.
 - Entries left by 0.1.0.x in `%LOCALAPPDATA%\NINA\Bortle\queue` record no owner
-  and are not sent; the plugin logs how many there are.
+  and are not sent; the status line and the log say how many there are.
 
 ## 0.1.1.0
 

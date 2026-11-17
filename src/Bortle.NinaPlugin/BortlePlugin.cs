@@ -72,7 +72,7 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         // queued is never sent with another's key.
         WarnAboutOldQueue(dataDir);
         _uploader = new Uploader(
-            new QueueStore(Path.Combine(dataDir, "queues")),
+            new QueueStore(Path.Combine(dataDir, "queues"), legacyQueue: Path.Combine(dataDir, "queue")),
             _client,
             () => new CaptureContext(ProfileId, new ClientSettings(ServerUrl, PluginKey), UploadEnabled),
             new NinaLog(),
@@ -263,7 +263,9 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
     {
         try
         {
-            if (UploadEnabled) _uploader.SequenceStarted(null);
+            // the session is named either way, so switching uploads on
+            // mid-sequence still ends this sequence's session
+            _uploader.SequenceStarted(null, queue: UploadEnabled);
         }
         catch (Exception ex)
         {
@@ -277,14 +279,13 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
         try
         {
             // NINA raises this right after the last instruction, while the
-            // last image is still being saved; end the session behind it.
-            if (UploadEnabled)
-            {
-                _ = _uploader.EndAfterSavesAsync(TimeSpan.FromMinutes(10), CancellationToken.None)
-                    .ContinueWith(
-                        t => Logger.Error($"Bortle: could not queue the session end: {t.Exception}"),
-                        TaskContinuationOptions.OnlyOnFaulted);
-            }
+            // last image is still being saved; end the session behind it. The
+            // end is queued even with uploads off: it is sent only once they
+            // are on again, and then closes what was sent.
+            _ = _uploader.EndAfterSavesAsync(TimeSpan.FromMinutes(10), CancellationToken.None)
+                .ContinueWith(
+                    t => Logger.Error($"Bortle: could not queue the session end: {t.Exception}"),
+                    TaskContinuationOptions.OnlyOnFaulted);
         }
         catch (Exception ex)
         {

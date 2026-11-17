@@ -9,10 +9,19 @@ namespace Bortle.Capture;
 /// <summary>Where Bortle is and the key it gave this plugin.</summary>
 public sealed record ClientSettings(string ServerUrl, string Key)
 {
+    /// <summary>
+    /// An http(s) address and a whole plugin key: "bnp_" and 32 more
+    /// characters (the server's secrets.token_urlsafe(24)). A key still being
+    /// typed is not complete, so frames taken meanwhile wait for the profile's
+    /// finished key instead of being filed under half of it.
+    /// </summary>
     public bool IsComplete =>
         Uri.TryCreate(ServerUrl?.Trim(), UriKind.Absolute, out var uri)
         && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-        && !string.IsNullOrWhiteSpace(Key);
+        && KeyShape.IsMatch(Key?.Trim() ?? "");
+
+    private static readonly System.Text.RegularExpressions.Regex KeyShape =
+        new("^bnp_[A-Za-z0-9_-]{32,}$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 }
 
 /// <summary>What to do with an answer.</summary>
@@ -157,9 +166,17 @@ public sealed class BortleClient
                 path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
                 bufferSize: 1 << 20, useAsync: true);
         }
-        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
+        catch (FileNotFoundException)
         {
             return new(Outcome.Drop, null, $"{System.IO.Path.GetFileName(path)} is gone");
+        }
+        catch (DirectoryNotFoundException e)
+        {
+            return new(Outcome.Retry, null, e.Message); // a share that dropped out
+        }
+        catch (UnauthorizedAccessException e)
+        {
+            return new(Outcome.Retry, null, e.Message);
         }
         catch (IOException e)
         {

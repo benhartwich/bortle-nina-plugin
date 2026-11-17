@@ -35,7 +35,18 @@ public sealed record QueueEntry
 /// A server session the plugin opened for one logical session, when it was
 /// last used and, once ended, when.
 /// </summary>
-public sealed record SessionState(string Id, DateTimeOffset LastUsed, DateTimeOffset? Ended = null);
+/// <remarks>
+/// <see cref="LastUsed"/> and <see cref="Ended"/> are CAPTURE times (when NINA
+/// made the entry), so a night sent late is judged as it happened.
+/// <see cref="Accepted"/>: the server has taken a frame into it.
+/// <see cref="Replaced"/>: opened because the server did not know the one before.
+/// </remarks>
+public sealed record SessionState(
+    string Id,
+    DateTimeOffset LastUsed,
+    DateTimeOffset? Ended = null,
+    bool Accepted = false,
+    bool Replaced = false);
 
 /// <summary>
 /// One owner's queue between NINA and the network, kept on disk.
@@ -63,7 +74,9 @@ public sealed class FrameQueue : IDisposable
     /// </summary>
     private readonly string Instance = Guid.NewGuid().ToString("N")[..12];
 
-    private long _counter;
+    // One counter for the process: it orders entries of the same tick across
+    // this process's queues (a profile's pending queue and its destination).
+    private static long s_counter;
 
     private readonly string _dir;
     private readonly string _sessionsFile;
@@ -73,6 +86,9 @@ public sealed class FrameQueue : IDisposable
 
     public event Action? Changed;
 
+    /// <summary>A damaged entry was set aside (its file name, now with ".bad").</summary>
+    public event Action<string>? Damaged;
+
     public FrameQueue(string directory)
     {
         Root = directory;
@@ -80,7 +96,21 @@ public sealed class FrameQueue : IDisposable
         _sessionsFile = System.IO.Path.Combine(directory, "sessions.json");
         _lockFile = System.IO.Path.Combine(directory, "drain.lock");
         Directory.CreateDirectory(_dir);
+        // Temporary files a crash left behind; an entry is never a .tmp.
+        foreach (var tmp in Directory.EnumerateFiles(_dir, "*.tmp"))
+        {
+            try
+            {
+                if (DateTime.UtcNow - File.GetLastWriteTimeUtc(tmp) > TimeSpan.FromDays(1)) File.Delete(tmp);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
     }
+
+    /// <summary>Entries set aside as damaged.</summary>
+    public int DamagedCount => Directory.EnumerateFiles(_dir, "*.bad").Count();
 
     public string Root { get; }
 
@@ -111,7 +141,7 @@ public sealed class FrameQueue : IDisposable
                 // Time first, so the names sort in the order things happened;
                 // the counter orders entries made in the same tick, the tag
                 // keeps two processes from ever choosing the same name.
-                var id = $"{created.UtcTicks:D19}-{Interlocked.Increment(ref _counter):D9}-{Instance}";
+                var id = $"{created.UtcTicks:D19}-{Interlocked.Increment(ref s_counter):D9}-{Instance}";
                 entry = new QueueEntry
                 {
                     Id = id,
@@ -140,32 +170,45 @@ public sealed class FrameQueue : IDisposable
         return entry;
     }
 
-    /// <summary>The oldest entry, or null when there is nothing to send.</summary>
+    /// <summary>
+    /// The oldest entry, or null when there is nothing to send. An entry that
+    /// cannot be READ just now (locked by a scanner or a backup) throws, so
+    /// the caller retries; only an entry whose CONTENT is damaged is set aside.
+    /// </summary>
     public QueueEntry? Peek()
     {
+        string? damaged = null;
+        QueueEntry? found = null;
         lock (_lock)
         {
             foreach (var file in Files().OrderBy(f => System.IO.Path.GetFileName(f), StringComparer.Ordinal))
             {
+                string text;
                 try
                 {
-                    var entry = JsonSerializer.Deserialize<QueueEntry>(File.ReadAllText(file));
-                    if (entry is null) throw new JsonException("empty entry");
-                    // the file name is the entry's identity, whatever is inside
-                    return entry with { Id = System.IO.Path.GetFileNameWithoutExtension(file) };
+                    text = File.ReadAllText(file);
                 }
                 catch (FileNotFoundException)
                 {
-                    // removed meanwhile by its owner; look at the next one
+                    continue; // removed meanwhile by its owner
                 }
-                catch (Exception e) when (e is JsonException or IOException)
+                try
+                {
+                    var entry = JsonSerializer.Deserialize<QueueEntry>(text) ?? throw new JsonException("empty entry");
+                    // the file name is the entry's identity, whatever is inside
+                    found = entry with { Id = System.IO.Path.GetFileNameWithoutExtension(file) };
+                    break;
+                }
+                catch (JsonException)
                 {
                     // A damaged entry would block every frame behind it.
                     TryMove(file, file + ".bad");
+                    damaged = System.IO.Path.GetFileName(file);
                 }
             }
-            return null;
         }
+        if (damaged is not null) Damaged?.Invoke(damaged);
+        return found;
     }
 
     /// <summary>Remove exactly this entry, never another with a similar name.</summary>
@@ -206,6 +249,16 @@ public sealed class FrameQueue : IDisposable
             {
                 return false;
             }
+        }
+    }
+
+    /// <summary>Let another process send this queue.</summary>
+    public void Release()
+    {
+        lock (_lock)
+        {
+            _drainLock?.Dispose();
+            _drainLock = null;
         }
     }
 
@@ -282,7 +335,7 @@ public sealed class FrameQueue : IDisposable
         {
             File.Move(from, to, overwrite: true);
         }
-        catch (IOException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
         }
     }
@@ -309,15 +362,52 @@ public sealed record CaptureContext(string ProfileId, ClientSettings Settings, b
 public sealed class QueueStore : IDisposable
 {
     private readonly string _root;
+    private readonly string? _legacy;
     private readonly Dictionary<string, FrameQueue> _queues = new();
     private readonly object _lock = new();
 
     public event Action? Changed;
 
-    public QueueStore(string root)
+    public event Action<string>? Damaged;
+
+    /// <param name="legacyQueue">
+    /// The single queue of 0.1.0.x, whose entries record no owner: never sent,
+    /// only counted so the status line can say they are there.
+    /// </param>
+    public QueueStore(string root, string? legacyQueue = null)
     {
         _root = root;
+        _legacy = legacyQueue;
         Directory.CreateDirectory(root);
+    }
+
+    public int LegacyCount
+    {
+        get
+        {
+            try
+            {
+                return _legacy is not null && Directory.Exists(_legacy)
+                    ? Directory.EnumerateFiles(_legacy, "*.json").Count()
+                    : 0;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                return 0;
+            }
+        }
+    }
+
+    /// <summary>Let go of the drain lock of every queue but these.</summary>
+    public void ReleaseExcept(params FrameQueue[] keep)
+    {
+        lock (_lock)
+        {
+            foreach (var queue in _queues.Values)
+            {
+                if (Array.IndexOf(keep, queue) < 0) queue.Release();
+            }
+        }
     }
 
     public FrameQueue Pending(string profileId) => For("p-" + Hash(profileId));
@@ -362,6 +452,7 @@ public sealed class QueueStore : IDisposable
             {
                 queue = new FrameQueue(System.IO.Path.Combine(_root, name));
                 queue.Changed += () => Changed?.Invoke();
+                queue.Damaged += file => Damaged?.Invoke(file);
                 _queues[name] = queue;
             }
             return queue;

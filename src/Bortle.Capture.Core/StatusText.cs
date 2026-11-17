@@ -32,6 +32,12 @@ public static class StatusText
             UploadProblem.Busy => "Eine andere N.I.N.A.-Instanz überträgt diese Warteschlange.",
             _ => s.Message,
         };
+        if (s.Legacy > 0)
+        {
+            var legacy = $"{s.Legacy} Einträge einer älteren Plugin-Version werden nicht übertragen "
+                + "(%LOCALAPPDATA%\\NINA\\Bortle\\queue): sie wissen nicht, zu welchem Profil sie gehören";
+            detail = string.IsNullOrEmpty(detail) ? legacy : $"{detail}\n{legacy}";
+        }
         if (s.Elsewhere > 0)
         {
             // never sent with this profile's key: they wait for their own

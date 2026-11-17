@@ -56,7 +56,7 @@ public sealed class UploaderTests : IDisposable
     private readonly FakeServer _server = new();
     private readonly NullLog _log = new();
     private DateTimeOffset _now = new(2026, 10, 12, 20, 0, 0, TimeSpan.Zero);
-    private ClientSettings _settings = new("https://bortle.example/", "bnp_secret");
+    private ClientSettings _settings = new("https://bortle.example/", "bnp_secretSSSSSSSSSSSSSSSSSSSSSSSSSSSS");
     private string _profile = "profile-a";
     private bool _enabled = true;
 
@@ -76,7 +76,7 @@ public sealed class UploaderTests : IDisposable
     private (Waiting, Uploader) Make(SaveTracker? saves = null)
     {
         // the client's own settings are never what the uploader sends with
-        var client = new BortleClient(new HttpClient(_server), () => new ClientSettings("https://wrong.example/", "bnp_wrong"));
+        var client = new BortleClient(new HttpClient(_server), () => new ClientSettings("https://wrong.example/", "bnp_wrongWWWWWWWWWWWWWWWWWWWWWWWWWWW"));
         var uploader = new Uploader(new QueueStore(Path.Combine(_dir, "queues")), client, Context, _log, () => _now, saves);
         return (new Waiting(uploader), uploader);
     }
@@ -118,7 +118,7 @@ public sealed class UploaderTests : IDisposable
                 "POST /capture/sessions/s1/end",
             },
             _server.Calls.Select(c => $"{c.Method} {c.Path}"));
-        Assert.All(_server.Calls, c => Assert.Equal("Bearer bnp_secret", c.Auth));
+        Assert.All(_server.Calls, c => Assert.Equal("Bearer bnp_secretSSSSSSSSSSSSSSSSSSSSSSSSSSSS", c.Auth));
         Assert.Equal(5760, _server.Calls[1].Bytes); // the whole file, streamed
         Assert.Equal(0, queue.Count);
         Assert.Null(uploader.Status.SessionId); // ended
@@ -189,10 +189,10 @@ public sealed class UploaderTests : IDisposable
         var (queue, uploader) = Make();
         uploader.FrameSaved(Frame("a.fits"), null);
         Assert.Equal(Uploader.KeyPause, await uploader.StepAsync(CancellationToken.None));
-        _settings = new ClientSettings("https://bortle.example/", "bnp_secret");
+        _settings = new ClientSettings("https://bortle.example/", "bnp_secretSSSSSSSSSSSSSSSSSSSSSSSSSSSS");
         Assert.Null(await uploader.StepAsync(CancellationToken.None)); // session opened, frame sent
         Assert.Equal(0, queue.Count);
-        Assert.All(_server.Calls, c => Assert.Equal("Bearer bnp_secret", c.Auth));
+        Assert.All(_server.Calls, c => Assert.Equal("Bearer bnp_secretSSSSSSSSSSSSSSSSSSSSSSSSSSSS", c.Auth));
         Assert.Equal(UploadProblem.None, uploader.Status.Problem);
     }
 
@@ -523,11 +523,11 @@ public sealed class UploaderTests : IDisposable
         Assert.Equal(expected, BortleClient.Classify(status, sessionScoped));
 
     [Theory]
-    [InlineData("https://bortle.eu", "bnp_x", true)]
-    [InlineData("http://192.168.1.20:3100", "bnp_x", true)]
-    [InlineData("bortle.eu", "bnp_x", false)]
+    [InlineData("https://bortle.eu", "bnp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", true)]
+    [InlineData("http://192.168.1.20:3100", "bnp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", true)]
+    [InlineData("bortle.eu", "bnp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", false)]
     [InlineData("https://bortle.eu", " ", false)]
-    [InlineData("ftp://bortle.eu", "bnp_x", false)]
+    [InlineData("ftp://bortle.eu", "bnp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", false)]
     public void Settings_are_complete_only_with_an_http_address_and_a_key(string url, string key, bool ok) =>
         Assert.Equal(ok, new ClientSettings(url, key).IsComplete);
 }

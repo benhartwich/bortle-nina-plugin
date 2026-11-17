@@ -26,7 +26,7 @@ public sealed class LivestreamClientTests
     {
         var answer = new Answer();
         var client = new BortleClient(
-            new HttpClient(answer), () => new ClientSettings("https://bortle.example/", "bnp_secret"));
+            new HttpClient(answer), () => new ClientSettings("https://bortle.example/", "bnp_secretSSSSSSSSSSSSSSSSSSSSSSSSSSSS"));
         return (client, answer);
     }
 
@@ -42,7 +42,7 @@ public sealed class LivestreamClientTests
         Assert.True(result.Value!.IsLive);
         Assert.Equal("IC 405", result.Value.Showing!.Target);
         Assert.Equal(900, result.Value.Showing.IntegrationSeconds);
-        Assert.Equal(("POST", "/capture/livestream/start", "Bearer bnp_secret"), answer.Calls[0]);
+        Assert.Equal(("POST", "/capture/livestream/start", "Bearer bnp_secretSSSSSSSSSSSSSSSSSSSSSSSSSSSS"), answer.Calls[0]);
     }
 
     [Fact]

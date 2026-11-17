@@ -13,8 +13,8 @@ public sealed class QueueOwnershipTests : IDisposable
     private readonly FakeServer _server = new();
     private readonly NullLog _log = new();
     private DateTimeOffset _now = new(2026, 11, 17, 20, 0, 0, TimeSpan.Zero);
-    private static readonly ClientSettings AccountA = new("https://a.example/", "bnp_key_a");
-    private static readonly ClientSettings AccountB = new("https://b.example/", "bnp_key_b");
+    private static readonly ClientSettings AccountA = new("https://a.example/", "bnp_key_aAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    private static readonly ClientSettings AccountB = new("https://b.example/", "bnp_key_bBBBBBBBBBBBBBBBBBBBBBBBBBBB");
     private CaptureContext _context = new("profile-1", AccountA);
 
     public void Dispose()
@@ -60,7 +60,7 @@ public sealed class QueueOwnershipTests : IDisposable
         uploader.FrameSaved(Frame("b.fits"), "M 31");
         await Drain(uploader);
 
-        Assert.All(_server.Calls, c => Assert.Equal("Bearer bnp_key_b", c.Auth));
+        Assert.All(_server.Calls, c => Assert.Equal("Bearer bnp_key_bBBBBBBBBBBBBBBBBBBBBBBBBBBB", c.Auth));
         Assert.DoesNotContain(_server.Calls, c => c.Path.Contains("a.fits"));
         Assert.Contains(_server.Calls, c => c.Path.Contains("b.fits"));
         Assert.Equal(0, uploader.Waiting);
@@ -73,7 +73,7 @@ public sealed class QueueOwnershipTests : IDisposable
         await Drain(uploader);
         var sent = _server.Calls.Skip(before).ToList();
         Assert.Contains(sent, c => c.Path.Contains("a.fits"));
-        Assert.All(sent, c => Assert.Equal("Bearer bnp_key_a", c.Auth));
+        Assert.All(sent, c => Assert.Equal("Bearer bnp_key_aAAAAAAAAAAAAAAAAAAAAAAAAAAA", c.Auth));
         Assert.Equal(0, uploader.Status.Elsewhere);
     }
 
@@ -100,7 +100,7 @@ public sealed class QueueOwnershipTests : IDisposable
         uploader.FrameSaved(Frame("b1.fits"), null);
         await Drain(uploader);
         // B never hears of A's session id: it gets a session of its own
-        var toB = _server.Calls.Where(c => c.Auth == "Bearer bnp_key_b").Select(c => c.Path).ToList();
+        var toB = _server.Calls.Where(c => c.Auth == "Bearer bnp_key_bBBBBBBBBBBBBBBBBBBBBBBBBBBB").Select(c => c.Path).ToList();
         Assert.Equal(new[] { "/capture/sessions", "/capture/sessions/s2/frames/b1.fits" }, toB);
     }
 
@@ -115,7 +115,7 @@ public sealed class QueueOwnershipTests : IDisposable
         Assert.Empty(_server.Calls);
         _context = new CaptureContext("profile-1", AccountA); // the key arrives in its own profile
         await Drain(uploader);
-        Assert.Contains(_server.Calls, c => c.Path.Contains("early.fits") && c.Auth == "Bearer bnp_key_a");
+        Assert.Contains(_server.Calls, c => c.Path.Contains("early.fits") && c.Auth == "Bearer bnp_key_aAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     }
 
     // --- 2. two N.I.N.A. instances --------------------------------------------------
@@ -193,8 +193,9 @@ public sealed class QueueOwnershipTests : IDisposable
         var endOfA = uploader.EndAfterSavesAsync(TimeSpan.FromMinutes(10), CancellationToken.None);
 
         uploader.SequenceStarted("B"); // B begins while A's end waits
-        uploader.FrameSaved(Frame("b.fits"), null);
+        uploader.FrameSaved(Frame("a_last.fits"), null); // A's last image lands now
         saves.SaveFinished();
+        uploader.FrameSaved(Frame("b.fits"), null);
         _now += SaveTracker.DefaultQuiet + TimeSpan.FromSeconds(1);
         await endOfA;
         await Drain(uploader);
@@ -206,6 +207,7 @@ public sealed class QueueOwnershipTests : IDisposable
                 "/capture/sessions",
                 "/capture/sessions/s1/frames/a.fits",
                 "/capture/sessions",
+                "/capture/sessions/s1/frames/a_last.fits",
                 "/capture/sessions/s2/frames/b.fits",
                 "/capture/sessions/s1/end",
             },
