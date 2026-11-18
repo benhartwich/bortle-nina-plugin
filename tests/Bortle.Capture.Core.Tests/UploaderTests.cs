@@ -1,202 +1,69 @@
 using System.Net;
-using System.Text;
+using System.Reflection;
 using Xunit;
+using static Bortle.Capture.Tests.Keys;
 
 namespace Bortle.Capture.Tests;
 
-/// <summary>A server that answers from a script and remembers what it was asked.</summary>
-internal sealed class FakeServer : HttpMessageHandler
-{
-    public readonly List<(string Method, string Path, string? Auth, long Bytes)> Calls = new();
-    public readonly Queue<HttpStatusCode> Script = new();
-    private int _sessions;
-
-    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
-    {
-        long bytes = 0;
-        if (request.Content is not null)
-        {
-            bytes = (await request.Content.ReadAsByteArrayAsync(ct)).Length;
-        }
-        var path = request.RequestUri!.PathAndQuery;
-        Calls.Add((request.Method.Method, path, request.Headers.Authorization?.ToString(), bytes));
-        var status = Script.Count > 0 ? Script.Dequeue() : HttpStatusCode.OK;
-        if (status != HttpStatusCode.OK)
-        {
-            return new HttpResponseMessage(status) { Content = Json("{\"detail\":\"no\"}") };
-        }
-        if (path.EndsWith("/capture/sessions"))
-        {
-            _sessions++;
-            return new HttpResponseMessage(status)
-            {
-                Content = Json($"{{\"id\":\"s{_sessions}\",\"state\":\"open\",\"level\":\"guarded\"}}"),
-            };
-        }
-        if (path.Contains("/frames/"))
-        {
-            return new HttpResponseMessage(status) { Content = Json("{\"stored\":true,\"project\":\"p\"}") };
-        }
-        return new HttpResponseMessage(status) { Content = Json("{\"id\":\"x\",\"state\":\"closed\"}") };
-    }
-
-    private static StringContent Json(string text) => new(text, Encoding.UTF8, "application/json");
-}
-
-internal sealed class NullLog : ILog
-{
-    public readonly List<string> Errors = new();
-    public void Info(string message) { }
-    public void Error(string message) => Errors.Add(message);
-}
-
+/// <summary>
+/// The upload queue, night by night. Includes every case from the N.I.N.A.
+/// manifest review (#795) and the three adversarial review rounds before
+/// 0.1.2.0 that still apply to the sequence-id design.
+/// </summary>
 public sealed class UploaderTests : IDisposable
 {
+    private static readonly ClientSettings S1 = new("https://a.example/", K1);
+    private static readonly ClientSettings S2 = new("https://b.example/", K2);
+
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "bortle-test-" + Guid.NewGuid().ToString("N"));
     private readonly FakeServer _server = new();
     private readonly NullLog _log = new();
-    private DateTimeOffset _now = new(2026, 10, 12, 20, 0, 0, TimeSpan.Zero);
-    private ClientSettings _settings = new("https://bortle.example/", "bnp_secret");
-    private string _profile = "profile-a";
-    private bool _enabled = true;
-
-    private CaptureContext Context() => new(_profile, _settings, _enabled);
-
-    /// <summary>What the active profile still has to send.</summary>
-    private sealed class Waiting(Uploader uploader)
-    {
-        public int Count => uploader.Waiting;
-    }
+    private DateTimeOffset _now = new(2026, 11, 17, 20, 0, 0, TimeSpan.Zero);
+    private CaptureContext _context = new("profile-1", S1);
 
     public void Dispose()
     {
-        if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
-    }
-
-    private (Waiting, Uploader) Make(SaveTracker? saves = null)
-    {
-        // the client's own settings are never what the uploader sends with
-        var client = new BortleClient(new HttpClient(_server), () => new ClientSettings("https://wrong.example/", "bnp_wrong"));
-        var uploader = new Uploader(new QueueStore(Path.Combine(_dir, "queues")), client, Context, _log, () => _now, saves);
-        return (new Waiting(uploader), uploader);
-    }
-
-    private string Frame(string name, int size = 2880)
-    {
-        Directory.CreateDirectory(Path.Combine(_dir, "frames"));
-        var path = Path.Combine(_dir, "frames", name);
-        File.WriteAllBytes(path, new byte[size]);
-        return path;
-    }
-
-    private static async Task Drain(Uploader uploader, int maxSteps = 20)
-    {
-        for (var i = 0; i < maxSteps; i++)
+        try
         {
-            var wait = await uploader.StepAsync(CancellationToken.None);
-            if (uploader.Status.State == UploaderState.Idle) return;
-            if (wait is not null && uploader.Status.State != UploaderState.Sending) return;
+            Directory.Delete(_dir, true);
+        }
+        catch (IOException)
+        {
         }
     }
 
-    [Fact]
-    public async Task A_night_goes_out_in_the_order_it_happened()
-    {
-        var (queue, uploader) = Make();
-        uploader.SequenceStarted("M42");
-        uploader.FrameSaved(Frame("M42_0001.fits", 5760), "M 42");
-        uploader.FrameSaved(Frame("M42_0002.fits"), "M 42");
-        uploader.SequenceFinished();
-        await Drain(uploader);
+    private Uploader Make(SaveTracker? saves = null) =>
+        new(
+            new QueueStore(Path.Combine(_dir, "queues"), Path.Combine(_dir, "queue")),
+            // the client's own settings are never what is sent with
+            new BortleClient(new HttpClient(_server), () => new ClientSettings("https://wrong.example/", K2)),
+            () => _context,
+            _log,
+            () => _now,
+            saves)
+        {
+            Poll = TimeSpan.FromMilliseconds(5),
+            SettingsSettle = TimeSpan.FromMilliseconds(200),
+        };
 
-        Assert.Equal(
-            new[]
-            {
-                "POST /capture/sessions",
-                "PUT /capture/sessions/s1/frames/M42_0001.fits?target=M%2042",
-                "PUT /capture/sessions/s1/frames/M42_0002.fits?target=M%2042",
-                "POST /capture/sessions/s1/end",
-            },
-            _server.Calls.Select(c => $"{c.Method} {c.Path}"));
-        Assert.All(_server.Calls, c => Assert.Equal("Bearer bnp_secret", c.Auth));
-        Assert.Equal(5760, _server.Calls[1].Bytes); // the whole file, streamed
-        Assert.Equal(0, queue.Count);
-        Assert.Null(uploader.Status.SessionId); // ended
+    private string Frame(string name, string folder = "frames")
+    {
+        var dir = Path.Combine(_dir, folder);
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, name);
+        File.WriteAllBytes(path, new byte[2880]);
+        return path;
     }
 
-    [Fact]
-    public async Task A_server_failure_keeps_the_frame_and_backs_off()
+    private static async Task Drain(Uploader u, int steps = 30)
     {
-        var (queue, uploader) = Make();
-        uploader.FrameSaved(Frame("a.fits"), null);
-        _server.Script.Enqueue(HttpStatusCode.OK); // the implicit session start
-        _server.Script.Enqueue(HttpStatusCode.BadGateway);
-        _server.Script.Enqueue(HttpStatusCode.ServiceUnavailable);
-
-        Assert.Equal(Uploader.FirstRetry, await uploader.StepAsync(CancellationToken.None));
-        Assert.Equal(UploaderState.Retrying, uploader.Status.State);
-        Assert.Equal(Uploader.FirstRetry * 2, await uploader.StepAsync(CancellationToken.None));
-        Assert.Equal(1, queue.Count);
-        Assert.Null(await uploader.StepAsync(CancellationToken.None)); // through
-        Assert.Equal(0, queue.Count);
-        // one session for all three attempts
-        Assert.Single(_server.Calls, c => c.Path == "/capture/sessions");
+        for (var i = 0; i < steps; i++)
+        {
+            var wait = await u.StepAsync(CancellationToken.None);
+            if (wait is not null && u.Status.State != UploaderState.Sending) return;
+        }
     }
 
-    [Fact]
-    public async Task A_wrong_key_pauses_briefly_without_losing_anything()
-    {
-        var (queue, uploader) = Make();
-        uploader.FrameSaved(Frame("a.fits"), null);
-        _server.Script.Enqueue(HttpStatusCode.Unauthorized);
-        // short: the key may be fixed (or the profile switched back) any moment
-        Assert.Equal(Uploader.KeyPause, await uploader.StepAsync(CancellationToken.None));
-        Assert.True(Uploader.KeyPause <= TimeSpan.FromMinutes(1));
-        Assert.Equal(UploaderState.Paused, uploader.Status.State);
-        Assert.Equal(UploadProblem.KeyRejected, uploader.Status.Problem);
-        Assert.Equal(1, queue.Count);
-    }
-
-    [Fact]
-    public async Task Without_settings_nothing_is_sent_and_the_pause_is_short()
-    {
-        _settings = new ClientSettings("", "");
-        var (queue, uploader) = Make();
-        uploader.FrameSaved(Frame("a.fits"), null);
-        Assert.Equal(Uploader.KeyPause, await uploader.StepAsync(CancellationToken.None));
-        Assert.Equal(UploadProblem.KeyMissing, uploader.Status.Problem);
-        Assert.Empty(_server.Calls);
-        Assert.Equal(1, queue.Count);
-    }
-
-    [Fact]
-    public async Task A_full_quota_keeps_the_long_pause()
-    {
-        var (queue, uploader) = Make();
-        uploader.FrameSaved(Frame("a.fits"), null);
-        _server.Script.Enqueue(HttpStatusCode.RequestEntityTooLarge);
-        Assert.Equal(Uploader.PauseFor, await uploader.StepAsync(CancellationToken.None));
-        Assert.Equal(UploadProblem.Quota, uploader.Status.Problem);
-        Assert.Equal(1, queue.Count);
-    }
-
-    [Fact]
-    public async Task The_key_is_read_again_on_every_step()
-    {
-        // NINA keeps the key in the ACTIVE profile; a key that appears later
-        // (profile loaded, switched, or pasted) is used on the next step.
-        _settings = new ClientSettings("https://bortle.example/", "");
-        var (queue, uploader) = Make();
-        uploader.FrameSaved(Frame("a.fits"), null);
-        Assert.Equal(Uploader.KeyPause, await uploader.StepAsync(CancellationToken.None));
-        _settings = new ClientSettings("https://bortle.example/", "bnp_secret");
-        Assert.Null(await uploader.StepAsync(CancellationToken.None)); // session opened, frame sent
-        Assert.Equal(0, queue.Count);
-        Assert.All(_server.Calls, c => Assert.Equal("Bearer bnp_secret", c.Auth));
-        Assert.Equal(UploadProblem.None, uploader.Status.Problem);
-    }
-
-    /// <summary>Run the real loop and wait until <paramref name="done"/> or time out.</summary>
     private static async Task<bool> Eventually(Func<bool> done, int ms = 5000)
     {
         var until = DateTime.UtcNow.AddMilliseconds(ms);
@@ -208,326 +75,897 @@ public sealed class UploaderTests : IDisposable
         return done();
     }
 
+    // --- a night ------------------------------------------------------------------
+
     [Fact]
-    public async Task A_new_frame_wakes_an_idle_uploader()
+    public async Task A_night_goes_out_in_the_order_it_happened_named_by_its_sequence()
     {
-        var (queue, uploader) = Make();
-        uploader.Start();
-        // the loop found nothing and sleeps for a minute
-        Assert.True(await Eventually(() => uploader.Status.State == UploaderState.Idle));
-        uploader.FrameSaved(Frame("a.fits"), null);
-        Assert.True(await Eventually(() => queue.Count == 0), "the frame waited for the idle minute");
-        await uploader.StopAsync();
+        var u = Make();
+        u.SequenceStarted("M42");
+        u.FrameSaved(Frame("M42_0001.fits"), "M 42");
+        u.FrameSaved(Frame("M42_0002.fits"), "M 42");
+        u.SequenceFinished();
+        await Drain(u);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/M42_0001.fits?target=M%2042",
+                "PUT /capture/sequences/q1/frames/M42_0002.fits?target=M%2042",
+                "POST /capture/sequences/q1/end",
+            },
+            _server.Wire);
+        Assert.All(_server.Calls, c => Assert.Equal("Bearer " + K1, c.Auth));
+        Assert.Equal(2880, _server.Calls[1].Bytes);
+        Assert.Equal(0, u.Waiting);
     }
 
     [Fact]
-    public async Task A_successful_connection_test_ends_the_pause_at_once()
+    public async Task A_server_failure_keeps_the_frame_and_backs_off()
     {
-        var (queue, uploader) = Make();
-        uploader.Start();
-        Assert.True(await Eventually(() => uploader.Status.State == UploaderState.Idle));
+        var u = Make();
+        u.FrameSaved(Frame("a.fits"), null);
+        _server.Script.Enqueue(HttpStatusCode.BadGateway);
+        _server.Script.Enqueue(HttpStatusCode.ServiceUnavailable);
+        Assert.Equal(Uploader.FirstRetry, await u.StepAsync(CancellationToken.None));
+        Assert.Equal(Uploader.FirstRetry * 2, await u.StepAsync(CancellationToken.None));
+        Assert.Equal(1, u.Waiting);
+        Assert.Null(await u.StepAsync(CancellationToken.None));
+        Assert.Equal(0, u.Waiting);
+    }
+
+    [Fact]
+    public async Task A_404_is_retried_with_backoff_and_opens_nothing()
+    {
+        // a route the server or a proxy does not have: never a reason to start anything
+        var u = Make();
+        u.FrameSaved(Frame("a.fits"), null);
+        for (var i = 0; i < 5; i++) _server.Script.Enqueue(HttpStatusCode.NotFound);
+        var waits = new List<TimeSpan?>();
+        for (var i = 0; i < 5; i++) waits.Add(await u.StepAsync(CancellationToken.None));
+        Assert.All(waits, w => Assert.NotNull(w));
+        Assert.True(waits[^1] > waits[0]);
+        Assert.All(_server.Wire, c => Assert.Equal("PUT /capture/sequences/q1/frames/a.fits", c));
+        Assert.Contains("older than 2026-11", u.Status.Message);
+        Assert.Null(await u.StepAsync(CancellationToken.None));
+        Assert.Equal(0, u.Waiting);
+    }
+
+    [Fact]
+    public async Task A_wrong_key_pauses_briefly_without_losing_anything()
+    {
+        var u = Make();
+        u.FrameSaved(Frame("a.fits"), null);
         _server.Script.Enqueue(HttpStatusCode.Unauthorized);
-        uploader.FrameSaved(Frame("a.fits"), null);
-        Assert.True(await Eventually(() => uploader.Status.Problem == UploadProblem.KeyRejected));
-        await Task.Delay(300);
-        Assert.Equal(1, queue.Count); // paused: nothing goes until the 30 s are up
-        Assert.Equal(UploadProblem.KeyRejected, uploader.Status.Problem);
-        // the person fixes the key and presses "Verbindung testen"
-        uploader.ConnectionConfirmed();
-        Assert.True(await Eventually(() => queue.Count == 0), "the frame waited out the pause");
-        await uploader.StopAsync();
+        Assert.Equal(Uploader.KeyPause, await u.StepAsync(CancellationToken.None));
+        Assert.Equal(UploadProblem.KeyRejected, u.Status.Problem);
+        Assert.Equal(1, u.Waiting);
     }
 
     [Fact]
-    public async Task Typing_a_key_sends_one_request_after_the_typing_not_one_per_keystroke()
+    public async Task A_full_quota_keeps_the_long_pause()
     {
-        var (queue, uploader) = Make();
-        uploader.SettingsSettle = TimeSpan.FromMilliseconds(300);
-        uploader.Start();
-        Assert.True(await Eventually(() => uploader.Status.State == UploaderState.Idle));
-        _server.Script.Enqueue(HttpStatusCode.Unauthorized);
-        uploader.FrameSaved(Frame("a.fits"), null);
-        Assert.True(await Eventually(() => uploader.Status.Problem == UploadProblem.KeyRejected));
-        var before = _server.Calls.Count;
-        // the field saves on every keystroke: 20 characters, 30 ms apart
-        for (var i = 0; i < 20; i++)
-        {
-            uploader.SettingsChanged();
-            await Task.Delay(30);
-        }
-        Assert.Equal(before, _server.Calls.Count); // nothing sent while typing
-        Assert.True(await Eventually(() => queue.Count == 0), "the finished key was not tried");
-        // once quiet: session start + frame, i.e. one attempt
-        Assert.Equal(before + 2, _server.Calls.Count);
-        await uploader.StopAsync();
-        uploader.Dispose();
-    }
-
-    [Fact]
-    public async Task A_connection_test_resets_the_backoff()
-    {
-        var (queue, uploader) = Make();
-        uploader.FrameSaved(Frame("a.fits"), null);
-        _server.Script.Enqueue(HttpStatusCode.InternalServerError);
-        _server.Script.Enqueue(HttpStatusCode.InternalServerError);
-        Assert.Equal(Uploader.FirstRetry, await uploader.StepAsync(CancellationToken.None));
-        Assert.Equal(Uploader.FirstRetry * 2, await uploader.StepAsync(CancellationToken.None));
-        uploader.ConnectionConfirmed();
-        _server.Script.Enqueue(HttpStatusCode.InternalServerError);
-        Assert.Equal(Uploader.FirstRetry, await uploader.StepAsync(CancellationToken.None));
-        Assert.Equal(1, queue.Count);
-    }
-
-    [Fact]
-    public void The_status_line_names_the_key_problem_plainly()
-    {
-        var missing = new UploaderStatus(UploaderState.Paused, 3, "x", null, null, UploadProblem.KeyMissing);
-        var rejected = new UploaderStatus(UploaderState.Paused, 3, "HTTP 401", null, null, UploadProblem.KeyRejected);
-        Assert.Contains("Schlüssel fehlt in diesem NINA-Profil", StatusText.Describe(missing));
-        Assert.Contains("Schlüssel abgewiesen (401) – im aktiven Profil prüfen", StatusText.Describe(rejected));
-        Assert.Contains("3 in der Warteschlange", StatusText.Describe(rejected));
-        var fine = new UploaderStatus(UploaderState.Idle, 0, null, null, null);
-        Assert.DoesNotContain("Schlüssel", StatusText.Describe(fine));
-    }
-
-    [Fact]
-    public void A_rejected_key_is_announced_once_until_uploads_work_again()
-    {
-        var warning = new KeyWarning();
-        var rejected = new UploaderStatus(UploaderState.Paused, 1, null, null, null, UploadProblem.KeyRejected);
-        Assert.True(warning.ShouldWarn(rejected));
-        // each 30 s retry publishes "Sending", then the refusal again: quiet
-        Assert.False(warning.ShouldWarn(new UploaderStatus(UploaderState.Sending, 1, null, null, null)));
-        Assert.False(warning.ShouldWarn(rejected));
-        // a frame went through, later the key is refused again: say it again
-        var sent = new DateTimeOffset(2026, 11, 12, 21, 16, 0, TimeSpan.Zero);
-        Assert.False(warning.ShouldWarn(new UploaderStatus(UploaderState.Sending, 0, null, sent, null)));
-        Assert.True(warning.ShouldWarn(rejected with { LastSent = sent }));
+        var u = Make();
+        u.FrameSaved(Frame("a.fits"), null);
+        _server.Script.Enqueue(HttpStatusCode.RequestEntityTooLarge);
+        Assert.Equal(Uploader.PauseFor, await u.StepAsync(CancellationToken.None));
+        Assert.Equal(UploadProblem.Quota, u.Status.Problem);
     }
 
     [Fact]
     public async Task A_frame_the_server_refuses_is_skipped_and_logged()
     {
-        var (queue, uploader) = Make();
-        uploader.FrameSaved(Frame("bad.fits"), null);
-        uploader.FrameSaved(Frame("good.fits"), null);
-        _server.Script.Enqueue(HttpStatusCode.OK);
+        var u = Make();
+        u.FrameSaved(Frame("bad.fits"), null);
+        u.FrameSaved(Frame("good.fits"), null);
         _server.Script.Enqueue(HttpStatusCode.BadRequest);
-        await Drain(uploader);
-        Assert.Equal(0, queue.Count);
+        await Drain(u);
         Assert.Contains(_server.Calls, c => c.Path.Contains("good.fits"));
         Assert.Contains(_log.Errors, e => e.Contains("bad.fits"));
     }
 
     [Fact]
-    public async Task A_deleted_frame_does_not_block_the_queue()
-    {
-        var (queue, uploader) = Make();
-        var gone = Frame("gone.fits");
-        uploader.FrameSaved(gone, null);
-        uploader.FrameSaved(Frame("next.fits"), null);
-        File.Delete(gone);
-        await Drain(uploader);
-        Assert.Equal(0, queue.Count);
-        Assert.DoesNotContain(_server.Calls, c => c.Path.Contains("gone.fits"));
-    }
-
-    [Fact]
     public async Task The_queue_survives_a_restart()
     {
-        var (_, first) = Make();
-        first.SequenceStarted(null);
+        var first = Make();
+        first.SequenceStarted("M42");
         first.FrameSaved(Frame("a.fits"), null);
-        await first.StepAsync(CancellationToken.None); // only the start went out
         first.Dispose();
-
-        var (queue, again) = Make();
-        Assert.Equal(1, queue.Count);
+        var again = Make(); // NINA never said the sequence finished: the new run ends it
+        Assert.Equal(3, again.Waiting);
         await Drain(again);
-        Assert.Equal("PUT /capture/sessions/s1/frames/a.fits", $"{_server.Calls[^1].Method} {_server.Calls[^1].Path}");
+        Assert.Equal(
+            new[] { "POST /capture/sequences/q1/start", "PUT /capture/sequences/q1/frames/a.fits", "POST /capture/sequences/q1/end" },
+            _server.Wire);
     }
 
     [Fact]
-    public async Task Last_nights_unended_session_is_not_tonights()
+    public async Task A_night_sent_days_later_is_still_one_sequence_with_its_end()
     {
-        var (queue, uploader) = Make();
-        uploader.SequenceStarted(null);
-        uploader.FrameSaved(Frame("a.fits"), null);
-        await Drain(uploader);
+        var u = Make();
+        u.SequenceStarted("seq");
+        for (var i = 0; i < 4; i++) u.FrameSaved(Frame($"{i}.fits"), null);
+        u.SequenceFinished();
+        _now += TimeSpan.FromDays(4);
+        await Drain(u);
+        Assert.All(_server.Wire, c => Assert.Contains("/q1/", c));
+        Assert.Equal("POST /capture/sequences/q1/end", _server.Wire[^1]);
+    }
+
+    // --- 1. ownership ---------------------------------------------------------------
+
+    [Fact]
+    public async Task A_frame_queued_for_account_A_is_never_sent_to_account_B()
+    {
+        var u = Make();
+        u.FrameSaved(Frame("a.fits"), null);
+        _context = _context with { Settings = S2 };
+        u.FrameSaved(Frame("b.fits"), null);
+        await Drain(u);
+        Assert.All(_server.Calls, c => Assert.Equal("Bearer " + K2, c.Auth));
+        Assert.DoesNotContain(_server.Calls, c => c.Path.Contains("a.fits"));
+        Assert.Equal(1, u.Status.Elsewhere);
+        Assert.Contains("anderes Profil", StatusText.Describe(u.Status));
+        _context = _context with { Settings = S1 };
+        await Drain(u);
+        Assert.Contains(_server.Calls, c => c.Path.Contains("a.fits") && c.Auth == "Bearer " + K1);
+        Assert.Equal(0, u.Status.Elsewhere);
+    }
+
+    [Fact]
+    public async Task Another_profile_with_the_same_key_does_not_send_this_profiles_backlog()
+    {
+        var u = Make();
+        u.FrameSaved(Frame("a.fits"), null);
+        _context = new CaptureContext("profile-2", S1);
+        await Drain(u);
+        Assert.Empty(_server.Calls);
+        Assert.Equal(1, u.Status.Elsewhere);
+    }
+
+    [Fact]
+    public async Task Frames_from_before_the_key_go_with_the_key_of_their_own_profile_only()
+    {
+        _context = new CaptureContext("profile-1", new ClientSettings("https://a.example/", ""));
+        var u = Make();
+        u.FrameSaved(Frame("early.fits"), null);
+        _context = new CaptureContext("profile-2", S2);
+        await Drain(u);
+        Assert.Empty(_server.Calls);
+        _context = new CaptureContext("profile-1", S1);
+        await Drain(u);
+        Assert.Contains(_server.Calls, c => c.Path.Contains("early.fits") && c.Auth == "Bearer " + K1);
+    }
+
+    [Fact]
+    public async Task A_key_missing_for_a_moment_keeps_the_order()
+    {
+        var u = Make();
+        u.SequenceStarted("seq");
+        u.FrameSaved(Frame("1.fits"), null);
+        _context = _context with { Settings = new ClientSettings("https://a.example/", "") };
+        u.FrameSaved(Frame("2.fits"), null);
+        _context = _context with { Settings = S1 };
+        u.FrameSaved(Frame("3.fits"), null);
+        u.SequenceFinished();
+        await Drain(u);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/1.fits",
+                "PUT /capture/sequences/q1/frames/2.fits",
+                "PUT /capture/sequences/q1/frames/3.fits",
+                "POST /capture/sequences/q1/end",
+            },
+            _server.Wire);
+    }
+
+    [Fact]
+    public void A_half_typed_key_is_not_a_key()
+    {
+        Assert.True(new ClientSettings("https://bortle.eu", K1).IsComplete);
+        Assert.False(new ClientSettings("https://bortle.eu", K1[..20]).IsComplete);
+        Assert.False(new ClientSettings("https://bortle.eu", "bnp_").IsComplete);
+        Assert.False(new ClientSettings("https://bortle.eu", "agent_" + K1[4..]).IsComplete);
+        Assert.False(new ClientSettings("bortle.eu", K1).IsComplete);
+        Assert.False(new ClientSettings("ftp://bortle.eu", K1).IsComplete);
+        Assert.True(new ClientSettings("http://192.168.1.20:3100", K1).IsComplete);
+    }
+
+    // --- 2. two N.I.N.A. instances --------------------------------------------------
+
+    [Fact]
+    public void Two_instances_never_replace_or_delete_each_others_entries()
+    {
+        var dir = Path.Combine(_dir, "shared");
+        using var first = new FrameQueue(dir);
+        using var second = new FrameQueue(dir);
+        var a = first.Enqueue(EntryKind.Frame, _now, "s", "a.fits");
+        var b = second.Enqueue(EntryKind.Frame, _now, "s", "b.fits");
+        Assert.NotEqual(a.Id, b.Id);
+        Assert.Equal(2, first.Count);
+        first.Remove(a);
+        Assert.True(second.Contains(b));
+        Assert.Equal("b.fits", second.Peek()?.Path);
+    }
+
+    [Fact]
+    public async Task Only_one_instance_sends_a_queue_and_a_profile_switch_lets_go()
+    {
+        var one = Make();
+        var two = Make();
+        one.FrameSaved(Frame("a.fits"), null);
+        two.FrameSaved(Frame("b.fits"), null);
+        await Drain(one);
+        Assert.Equal(Uploader.KeyPause, await two.StepAsync(CancellationToken.None));
+        Assert.Equal(UploadProblem.Busy, two.Status.Problem);
+        Assert.Single(_server.Calls, c => c.Path.EndsWith("/a.fits"));
+        Assert.Single(_server.Calls, c => c.Path.EndsWith("/b.fits"));
+        // the first NINA switches to another profile: the second takes over
+        var profile = "profile-1";
+        var oneOnOther = new CaptureContext("profile-9", S1);
+        _context = oneOnOther;
+        await one.StepAsync(CancellationToken.None);
+        _context = new CaptureContext(profile, S1);
+        two.FrameSaved(Frame("c.fits"), null);
+        await Drain(two);
+        Assert.Contains(_server.Calls, c => c.Path.EndsWith("/c.fits"));
+        one.Dispose();
+        two.Dispose();
+    }
+
+    [Fact]
+    public async Task The_pending_queue_is_not_starved_by_another_instance()
+    {
+        var owner = Make();
+        await owner.StepAsync(CancellationToken.None); // holds profile-1 + K1
+        var noKey = new CaptureContext("profile-1", new ClientSettings("https://a.example/", ""));
+        var saved = _context;
+        _context = noKey;
+        var capturer = Make();
+        capturer.FrameSaved(Frame("pending.fits"), null);
+        _context = saved;
+        var other = Make();
+        for (var i = 0; i < 5; i++)
+        {
+            await other.StepAsync(CancellationToken.None);
+            await owner.StepAsync(CancellationToken.None);
+        }
+        Assert.Contains(_server.Calls, c => c.Path.EndsWith("pending.fits"));
+        owner.Dispose();
+        other.Dispose();
+        capturer.Dispose();
+    }
+
+    // --- 3. the upload switch -------------------------------------------------------
+
+    [Fact]
+    public async Task Switching_uploads_off_stops_the_backlog_too_and_after_a_restart()
+    {
+        var u = Make();
+        u.FrameSaved(Frame("a.fits"), null);
+        _context = _context with { UploadEnabled = false };
+        Assert.Equal(Uploader.DisabledPoll, await u.StepAsync(CancellationToken.None));
+        Assert.Equal(UploadProblem.Disabled, u.Status.Problem);
+        u.Dispose();
+        var again = Make();
+        Assert.Equal(Uploader.DisabledPoll, await again.StepAsync(CancellationToken.None));
+        Assert.Empty(_server.Calls);
+        _context = _context with { UploadEnabled = true };
+        await Drain(again);
+        Assert.Contains(_server.Calls, c => c.Path.EndsWith("/a.fits"));
+    }
+
+    [Fact]
+    public async Task Uploads_switched_on_mid_sequence_still_end_that_sequence()
+    {
+        _context = _context with { UploadEnabled = false };
+        var u = Make();
+        u.SequenceStarted("seq", queue: false);
+        _context = _context with { UploadEnabled = true };
+        u.FrameSaved(Frame("1.fits"), null);
+        u.SequenceFinished();
+        await Drain(u);
+        Assert.Equal(new[] { "PUT /capture/sequences/q1/frames/1.fits", "POST /capture/sequences/q1/end" }, _server.Wire);
+    }
+
+    // --- 4. which sequence a frame belongs to --------------------------------------
+
+    [Fact]
+    public async Task A_late_end_names_its_own_sequence_not_the_next()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("a.fits"), null, _now);
+        _now += TimeSpan.FromMinutes(1);
+        var end = u.EndAfterSavesAsync(TimeSpan.FromMinutes(10), CancellationToken.None);
+        u.SequenceStarted("B");
+        u.FrameSaved(Frame("b.fits"), null, _now);
+        await end;
+        await Drain(u);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/a.fits",
+                "POST /capture/sequences/q1/end",
+                "POST /capture/sequences/q2/start",
+                "PUT /capture/sequences/q2/frames/b.fits",
+            },
+            _server.Wire);
+    }
+
+    [Fact]
+    public async Task An_image_written_after_the_next_sequence_began_goes_by_its_exposure_time()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        var exposedInA = _now + TimeSpan.FromMinutes(5);
+        _now += TimeSpan.FromMinutes(6);
+        u.SequenceFinished();
+        u.SequenceStarted("B");                                 // at once
+        u.FrameSaved(Frame("A_last.fits"), null, exposedInA);   // written only now
+        _now += TimeSpan.FromMinutes(1);
+        u.FrameSaved(Frame("B_1.fits"), null, _now - TimeSpan.FromSeconds(30));
+        await Drain(u);
+        Assert.Contains("PUT /capture/sequences/q1/frames/A_last.fits", _server.Wire);
+        Assert.Contains("PUT /capture/sequences/q2/frames/B_1.fits", _server.Wire);
+    }
+
+    [Fact]
+    public async Task A_snapshot_or_failed_save_does_not_move_the_next_frame()
+    {
+        // nothing is counted: only the frame's own exposure time decides
+        var saves = new SaveTracker(() => _now);
+        var u = Make(saves);
+        u.SequenceStarted("A");
+        saves.SaveStarted(); // never becomes a frame
+        u.SequenceStarted("B");
+        _now += TimeSpan.FromMinutes(2);
+        u.FrameSaved(Frame("B1.fits"), null, _now - TimeSpan.FromSeconds(30));
+        await Drain(u);
+        Assert.Contains("PUT /capture/sequences/q2/frames/B1.fits", _server.Wire);
+    }
+
+    [Fact]
+    public async Task Without_an_exposure_time_a_frame_soon_after_the_end_still_joins()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        u.SequenceFinished();
+        _now += TimeSpan.FromSeconds(13);
+        u.FrameSaved(Frame("late.fits"), null);
+        _now += Uploader.LateFrameWindow + TimeSpan.FromMinutes(1);
+        u.FrameSaved(Frame("much_later.fits"), null);
+        await Drain(u);
+        Assert.Contains("PUT /capture/sequences/q1/frames/late.fits", _server.Wire);
+        Assert.Contains("PUT /capture/sequences/q2/frames/much_later.fits", _server.Wire);
+    }
+
+    [Fact]
+    public async Task Frames_by_hand_share_one_id_until_a_long_pause()
+    {
+        var u = Make();
+        u.FrameSaved(Frame("a.fits"), null);
+        _now += TimeSpan.FromHours(1);
+        u.FrameSaved(Frame("b.fits"), null);
         _now += Uploader.SessionIdle + TimeSpan.FromHours(1);
-        uploader.FrameSaved(Frame("b.fits"), null);
-        await Drain(uploader);
-        Assert.Contains(_server.Calls, c => c.Path == "/capture/sessions/s2/frames/b.fits");
+        u.FrameSaved(Frame("c.fits"), null);
+        await Drain(u);
+        Assert.Equal(
+            new[]
+            {
+                "PUT /capture/sequences/q1/frames/a.fits",
+                "PUT /capture/sequences/q1/frames/b.fits",
+                "PUT /capture/sequences/q2/frames/c.fits",
+            },
+            _server.Wire);
     }
 
     [Fact]
-    public async Task A_session_the_server_forgot_is_replaced()
+    public async Task Ending_twice_sends_one_end_and_one_no_op()
     {
-        var (queue, uploader) = Make();
-        uploader.SequenceStarted(null);
-        await Drain(uploader);
-        uploader.FrameSaved(Frame("a.fits"), null);
-        _server.Script.Enqueue(HttpStatusCode.NotFound);
-        await Drain(uploader);
-        Assert.Equal("/capture/sessions/s2/frames/a.fits", _server.Calls[^1].Path);
-        Assert.Equal(0, queue.Count);
+        var u = Make();
+        u.SequenceStarted("seq");
+        u.SequenceFinished(); // the instruction
+        u.SequenceFinished(); // then NINA's own event
+        await Drain(u);
+        Assert.Single(_server.Wire, c => c.EndsWith("/end"));
     }
 
     [Fact]
-    public async Task Ending_twice_reports_once()
+    public async Task A_sequence_that_never_said_it_finished_is_ended_when_the_next_starts()
     {
-        var (_, uploader) = Make();
-        uploader.SequenceStarted(null);
-        uploader.SequenceFinished(); // the instruction
-        uploader.SequenceFinished(); // then NINA's own event
-        await Drain(uploader);
-        Assert.Single(_server.Calls, c => c.Path.EndsWith("/end"));
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("a.fits"), null);
+        u.SequenceStarted("B"); // NINA started B without finishing A
+        u.FrameSaved(Frame("b.fits"), null);
+        u.SequenceFinished();
+        await Drain(u);
+        Assert.Contains("POST /capture/sequences/q1/end", _server.Wire);
+        Assert.Equal("POST /capture/sequences/q2/end", _server.Wire[^1]);
     }
 
     [Fact]
-    public async Task Finishing_waits_for_the_frames_before_it()
+    public async Task The_sequence_running_when_NINA_stopped_is_ended_by_the_next_run()
     {
-        var (queue, uploader) = Make();
-        uploader.SequenceStarted(null);
-        uploader.FrameSaved(Frame("a.fits"), null);
-        uploader.Start();
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("a.fits"), null);
+        u.Dispose(); // NINA crashed: no SequenceFinished
+        var again = Make();
+        await Drain(again);
+        Assert.Equal("POST /capture/sequences/q1/end", _server.Wire[^1]);
+        again.Dispose();
+        var third = Make(); // and only once
+        await Drain(third);
+        Assert.Single(_server.Wire, c => c.EndsWith("/end"));
+    }
+
+    [Fact]
+    public async Task Frames_after_a_finish_instruction_mid_sequence_get_their_own_sequence()
+    {
+        var u = Make();
+        u.SequenceStarted("seq");
+        u.FrameSaved(Frame("1.fits"), null, _now);
+        _now += TimeSpan.FromMinutes(1);
+        await u.FinishSessionAsync(TimeSpan.Zero, CancellationToken.None); // the instruction, mid-sequence
+        _now += TimeSpan.FromMinutes(5);
+        u.FrameSaved(Frame("2.fits"), null, _now); // NINA carries on
+        await u.EndAfterSavesAsync(TimeSpan.Zero, CancellationToken.None); // NINA's own finish
+        await Drain(u);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/1.fits",
+                "POST /capture/sequences/q1/end",
+                "POST /capture/sequences/q2/start",
+                "PUT /capture/sequences/q2/frames/2.fits",
+                "POST /capture/sequences/q2/end",
+            },
+            _server.Wire);
+    }
+
+    // --- crashes, restarts, the PC itself ---------------------------------------------
+
+    [Fact]
+    public async Task The_end_is_on_disk_at_once_so_closing_NINA_loses_nothing()
+    {
+        var saves = new SaveTracker(() => _now);
+        var u = Make(saves);
+        u.SequenceStarted("seq");
+        saves.SaveStarted(); // the last image still on its way
+        await u.EndAfterSavesAsync(TimeSpan.FromMinutes(10), CancellationToken.None);
+        await u.StopAsync();
+        u.Dispose();
+        var again = Make();
+        await Drain(again);
+        Assert.Equal("POST /capture/sequences/q1/end", _server.Wire[^1]);
+    }
+
+    [Fact]
+    public async Task A_clock_stepped_back_keeps_the_order()
+    {
+        var u = Make();
+        u.SequenceStarted("seq");
+        _now -= TimeSpan.FromSeconds(30);
+        u.FrameSaved(Frame("1.fits"), null);
+        u.SequenceFinished();
+        await Drain(u);
+        Assert.Equal(
+            new[] { "POST /capture/sequences/q1/start", "PUT /capture/sequences/q1/frames/1.fits", "POST /capture/sequences/q1/end" },
+            _server.Wire);
+    }
+
+    [Fact]
+    public async Task After_a_restart_with_a_corrected_clock_the_old_backlog_still_goes_first()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("A1.fits"), null);
+        u.Dispose();
+        // a fresh process with the clock an hour behind (it was ahead before)
+        typeof(FrameQueue).GetField("s_lastTicks", BindingFlags.NonPublic | BindingFlags.Static)!.SetValue(null, 0L);
+        _now -= TimeSpan.FromHours(1);
+        var again = Make();
+        again.SequenceStarted("B");
+        again.FrameSaved(Frame("B1.fits"), null);
+        await Drain(again);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/A1.fits",
+                "POST /capture/sequences/q1/end", // A never finished: ended by the new run
+                "POST /capture/sequences/q2/start",
+                "PUT /capture/sequences/q2/frames/B1.fits",
+            },
+            _server.Wire);
+    }
+
+    [Fact]
+    public async Task A_deleted_queue_folder_neither_kills_the_loop_nor_loses_later_frames()
+    {
+        var u = Make();
+        u.FrameSaved(Frame("a.fits"), null);
+        u.Start();
         try
         {
-            Assert.True(await uploader.FinishSessionAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
-            Assert.Equal(0, queue.Count);
-            Assert.EndsWith("/end", _server.Calls[^1].Path);
+            await Task.Delay(200);
+            Directory.Delete(Path.Combine(_dir, "queues"), true);
+            u.Wake();
+            await Task.Delay(200);
+            var loop = (Task?)typeof(Uploader).GetField("_loop", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(u);
+            Assert.False(loop!.IsCompleted, $"the loop ended: {loop.Exception}");
+            u.FrameSaved(Frame("b.fits"), null);
+            Assert.True(await Eventually(() => _server.Calls.Any(c => c.Path.EndsWith("/b.fits"))));
         }
         finally
         {
-            await uploader.StopAsync();
+            await u.StopAsync();
         }
     }
 
     [Fact]
-    public async Task Finishing_gives_up_waiting_but_keeps_the_end_queued()
+    public async Task A_frame_on_an_unreachable_folder_waits_and_a_deleted_file_is_dropped()
     {
-        _settings = new ClientSettings("", ""); // nothing can go out
-        var (queue, uploader) = Make();
-        uploader.FrameSaved(Frame("a.fits"), null);
-        _now = DateTimeOffset.UtcNow;
-        var clockStart = _now;
-        var task = uploader.FinishSessionAsync(TimeSpan.FromSeconds(2), CancellationToken.None);
-        _now = clockStart + TimeSpan.FromSeconds(3);
-        Assert.False(await task);
-        Assert.Equal(2, queue.Count); // the frame and the end, both still there
+        var u = Make();
+        u.FrameSaved(Frame("share.fits", "nas"), null);
+        var gone = Frame("gone.fits");
+        u.FrameSaved(gone, null);
+        File.Delete(gone);
+        var nas = Path.Combine(_dir, "nas");
+        Directory.Move(nas, nas + "-offline");
+        await u.StepAsync(CancellationToken.None);
+        Assert.Equal(UploaderState.Retrying, u.Status.State);
+        Assert.Equal(2, u.Waiting);
+        Directory.Move(nas + "-offline", nas);
+        await Drain(u);
+        Assert.Contains(_server.Calls, c => c.Path.EndsWith("/share.fits"));
+        Assert.DoesNotContain(_server.Calls, c => c.Path.EndsWith("/gone.fits"));
+        Assert.Equal(0, u.Waiting);
+    }
+
+    [Fact]
+    public void A_damaged_entry_is_set_aside_and_reported()
+    {
+        var dir = Path.Combine(_dir, "q");
+        using var queue = new FrameQueue(dir);
+        var reported = new List<string>();
+        queue.Damaged += reported.Add;
+        File.WriteAllText(Path.Combine(dir, "queue", "0000000000000000001-000000001-x.json"), "{ not json");
+        Assert.Null(queue.Peek());
+        Assert.Single(reported);
+        Assert.Equal(1, queue.DamagedCount);
+    }
+
+    // --- finishing, waking, the status line ---------------------------------------
+
+    [Fact]
+    public async Task Finishing_waits_for_the_sequence_to_arrive()
+    {
+        var u = Make();
+        u.SequenceStarted("seq");
+        u.FrameSaved(Frame("a.fits"), null);
+        u.Start();
+        try
+        {
+            Assert.True(await u.FinishSessionAsync(TimeSpan.FromSeconds(30), CancellationToken.None));
+            Assert.Equal("POST /capture/sequences/q1/end", _server.Wire[^1]);
+        }
+        finally
+        {
+            await u.StopAsync();
+        }
     }
 
     [Fact]
     public async Task Finishing_waits_for_the_image_NINA_is_still_saving()
     {
-        // 2026-11-12: Finish ended the session at 20:42:51, NINA wrote the
-        // 5 s dark at 20:43:04, and the frame opened a session of its own.
         var saves = new SaveTracker(() => _now);
-        var (_, uploader) = Make(saves);
-        uploader.Poll = TimeSpan.FromMilliseconds(5);
-        uploader.SequenceStarted(null);
-        uploader.Start();
+        var u = Make(saves);
+        u.SequenceStarted("seq");
+        var exposed = _now;
+        saves.SaveStarted();
+        u.Start();
         try
         {
-            var finish = uploader.FinishSessionAsync(TimeSpan.FromMinutes(5), CancellationToken.None);
-            await Task.Delay(100, TestContext.Current.CancellationToken);
-            Assert.False(finish.IsCompleted); // the image may not have shown up yet
-
-            saves.SaveStarted(); // NINA's save worker picks the dark up
+            var finish = u.FinishSessionAsync(TimeSpan.FromMinutes(5), CancellationToken.None);
+            await Task.Delay(100);
+            Assert.False(finish.IsCompleted);
             _now += TimeSpan.FromSeconds(13);
-            uploader.FrameSaved(Frame("dark.fits"), null);
+            u.FrameSaved(Frame("dark.fits"), null, exposed);
             saves.SaveFinished();
-            await Task.Delay(100, TestContext.Current.CancellationToken);
-            Assert.False(finish.IsCompleted); // quiet counts from the save
-
             _now += SaveTracker.DefaultQuiet;
             Assert.True(await finish);
-            Assert.Single(_server.Calls, c => c.Path == "/capture/sessions");
-            Assert.Equal(
-                new[] { "/capture/sessions", "/capture/sessions/s1/frames/dark.fits", "/capture/sessions/s1/end" },
-                _server.Calls.Select(c => c.Path).ToArray());
+            Assert.Contains("PUT /capture/sequences/q1/frames/dark.fits", _server.Wire);
         }
         finally
         {
-            await uploader.StopAsync();
+            await u.StopAsync();
         }
     }
 
     [Fact]
-    public async Task A_frame_saved_after_the_end_joins_the_ended_session()
+    public async Task Finishing_does_not_hold_the_sequence_while_nothing_can_be_sent()
     {
-        var (queue, uploader) = Make();
-        uploader.SequenceStarted(null);
-        uploader.SequenceFinished();
-        await Drain(uploader);
-        _now += TimeSpan.FromSeconds(13);
-        uploader.FrameSaved(Frame("late.fits"), null);
-        await Drain(uploader);
-        Assert.Equal("/capture/sessions/s1/frames/late.fits", _server.Calls[^1].Path);
-        Assert.Single(_server.Calls, c => c.Path == "/capture/sessions");
-        Assert.Null(uploader.Status.SessionId); // the session stays ended
+        _context = _context with { UploadEnabled = false };
+        var u = Make();
+        u.SequenceStarted("seq", queue: false);
+        u.Start();
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Assert.False(await u.FinishSessionAsync(TimeSpan.FromSeconds(10), CancellationToken.None));
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"held the sequence for {sw.Elapsed}");
+        }
+        finally
+        {
+            await u.StopAsync();
+        }
     }
 
     [Fact]
-    public async Task A_frame_long_after_the_end_starts_a_new_session()
+    public async Task A_new_frame_wakes_an_idle_uploader()
     {
-        var (_, uploader) = Make();
-        uploader.SequenceStarted(null);
-        uploader.SequenceFinished();
-        await Drain(uploader);
-        _now += Uploader.LateFrameWindow + TimeSpan.FromMinutes(1);
-        uploader.FrameSaved(Frame("next.fits"), null);
-        await Drain(uploader);
-        Assert.Equal("/capture/sessions/s2/frames/next.fits", _server.Calls[^1].Path);
+        var u = Make();
+        u.Start();
+        Assert.True(await Eventually(() => u.Status.State == UploaderState.Idle));
+        u.FrameSaved(Frame("a.fits"), null);
+        Assert.True(await Eventually(() => u.Waiting == 0));
+        await u.StopAsync();
     }
 
     [Fact]
-    public async Task A_late_frame_the_ended_session_refuses_starts_a_new_one()
+    public async Task A_successful_connection_test_ends_the_pause_at_once()
     {
-        var (queue, uploader) = Make();
-        uploader.SequenceStarted(null);
-        uploader.SequenceFinished();
-        await Drain(uploader);
-        uploader.FrameSaved(Frame("late.fits"), null);
-        _server.Script.Enqueue(HttpStatusCode.NotFound); // the server no longer knows s1
-        await Drain(uploader);
-        Assert.Equal("/capture/sessions/s1/frames/late.fits", _server.Calls[^3].Path);
-        Assert.Equal("/capture/sessions", _server.Calls[^2].Path);
-        Assert.Equal("/capture/sessions/s2/frames/late.fits", _server.Calls[^1].Path);
-        Assert.Equal(0, queue.Count);
+        var u = Make();
+        u.Start();
+        Assert.True(await Eventually(() => u.Status.State == UploaderState.Idle));
+        _server.Script.Enqueue(HttpStatusCode.Unauthorized);
+        u.FrameSaved(Frame("a.fits"), null);
+        Assert.True(await Eventually(() => u.Status.Problem == UploadProblem.KeyRejected));
+        await Task.Delay(200);
+        Assert.Equal(1, u.Waiting);
+        u.ConnectionConfirmed();
+        Assert.True(await Eventually(() => u.Waiting == 0));
+        await u.StopAsync();
     }
 
     [Fact]
-    public async Task A_new_sequence_forgets_the_ended_session()
+    public async Task Typing_a_key_sends_one_request_after_the_typing()
     {
-        var (queue, uploader) = Make();
-        uploader.SequenceStarted(null);
-        uploader.SequenceFinished();
-        uploader.SequenceStarted(null);
-        uploader.FrameSaved(Frame("a.fits"), null);
-        await Drain(uploader);
-        Assert.Equal("/capture/sessions/s2/frames/a.fits", _server.Calls[^1].Path);
+        var u = Make();
+        u.Start();
+        Assert.True(await Eventually(() => u.Status.State == UploaderState.Idle));
+        _server.Script.Enqueue(HttpStatusCode.Unauthorized);
+        u.FrameSaved(Frame("a.fits"), null);
+        Assert.True(await Eventually(() => u.Status.Problem == UploadProblem.KeyRejected));
+        var before = _server.Calls.Count;
+        for (var i = 0; i < 10; i++)
+        {
+            u.SettingsChanged();
+            await Task.Delay(30);
+        }
+        Assert.Equal(before, _server.Calls.Count);
+        Assert.True(await Eventually(() => u.Waiting == 0));
+        Assert.Equal(before + 1, _server.Calls.Count);
+        await u.StopAsync();
+        u.Dispose();
+    }
+
+    [Fact]
+    public void The_status_line_names_problems_plainly()
+    {
+        Assert.Contains(StatusText.KeyMissing, StatusText.Describe(new UploaderStatus(UploaderState.Paused, 2, null, null, null, UploadProblem.KeyMissing)));
+        Assert.Contains("ausgeschaltet", StatusText.Describe(new UploaderStatus(UploaderState.Paused, 2, null, null, null, UploadProblem.Disabled)));
+        Assert.Contains("andere N.I.N.A.", StatusText.Describe(new UploaderStatus(UploaderState.Paused, 2, null, null, null, UploadProblem.Busy)));
+        var legacy = StatusText.Describe(new UploaderStatus(UploaderState.Idle, 0, null, null, null, Legacy: 3));
+        Assert.Contains("3 Einträge einer älteren Plugin-Version", legacy);
+    }
+
+    [Fact]
+    public void A_rejected_key_is_announced_once_until_uploads_work_again()
+    {
+        var warn = new KeyWarning();
+        var rejected = new UploaderStatus(UploaderState.Paused, 1, null, null, null, UploadProblem.KeyRejected);
+        Assert.True(warn.ShouldWarn(rejected));
+        Assert.False(warn.ShouldWarn(rejected));
+        Assert.True(warn.ShouldWarn(rejected with { LastSent = DateTimeOffset.UtcNow }));
     }
 
     [Theory]
-    [InlineData(HttpStatusCode.OK, false, Outcome.Ok)]
-    [InlineData(HttpStatusCode.Unauthorized, false, Outcome.KeyRejected)]
-    [InlineData(HttpStatusCode.Forbidden, false, Outcome.KeyRejected)]
-    [InlineData(HttpStatusCode.RequestEntityTooLarge, true, Outcome.Pause)]
-    [InlineData(HttpStatusCode.NotFound, true, Outcome.SessionGone)]
-    [InlineData(HttpStatusCode.NotFound, false, Outcome.Retry)]
-    [InlineData(HttpStatusCode.BadRequest, true, Outcome.Drop)]
-    [InlineData(HttpStatusCode.TooManyRequests, true, Outcome.Retry)]
-    [InlineData(HttpStatusCode.InternalServerError, true, Outcome.Retry)]
-    public void Answers_are_classified(HttpStatusCode status, bool sessionScoped, Outcome expected) =>
-        Assert.Equal(expected, BortleClient.Classify(status, sessionScoped));
+    [InlineData(HttpStatusCode.OK, Outcome.Ok)]
+    [InlineData(HttpStatusCode.Unauthorized, Outcome.KeyRejected)]
+    [InlineData(HttpStatusCode.Forbidden, Outcome.KeyRejected)]
+    [InlineData(HttpStatusCode.RequestEntityTooLarge, Outcome.Pause)]
+    [InlineData(HttpStatusCode.NotFound, Outcome.Retry)]
+    [InlineData(HttpStatusCode.BadRequest, Outcome.Drop)]
+    [InlineData(HttpStatusCode.TooManyRequests, Outcome.Retry)]
+    [InlineData(HttpStatusCode.InternalServerError, Outcome.Retry)]
+    public void Answers_are_classified(HttpStatusCode status, Outcome expected) =>
+        Assert.Equal(expected, BortleClient.Classify(status));
 
-    [Theory]
-    [InlineData("https://bortle.eu", "bnp_x", true)]
-    [InlineData("http://192.168.1.20:3100", "bnp_x", true)]
-    [InlineData("bortle.eu", "bnp_x", false)]
-    [InlineData("https://bortle.eu", " ", false)]
-    [InlineData("ftp://bortle.eu", "bnp_x", false)]
-    public void Settings_are_complete_only_with_an_http_address_and_a_key(string url, string key, bool ok) =>
-        Assert.Equal(ok, new ClientSettings(url, key).IsComplete);
+    // --- review round 5 ---------------------------------------------------------------
+
+    [Fact]
+    public async Task A_second_NINA_never_ends_the_sequence_the_first_is_running()
+    {
+        var a = Make();
+        a.SequenceStarted("A");
+        a.FrameSaved(Frame("1.fits"), null);
+        using (var b = Make()) // a second NINA starts on the same machine
+        {
+            await Drain(a);
+            Assert.DoesNotContain(_server.Wire, w => w.EndsWith("/end"));
+        }
+        a.FrameSaved(Frame("2.fits"), null);
+        a.SequenceFinished();
+        await Drain(a);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/1.fits",
+                "PUT /capture/sequences/q1/frames/2.fits",
+                "POST /capture/sequences/q1/end",
+            },
+            _server.Wire);
+        a.Dispose();
+    }
+
+    [Fact]
+    public async Task Two_NINAs_each_end_their_own_sequence_after_a_crash()
+    {
+        var a = Make();
+        a.SequenceStarted("A");
+        var b = Make();
+        b.SequenceStarted("B");
+        a.Dispose(); // both crash
+        b.Dispose();
+        using var again = Make();
+        await Drain(again);
+        Assert.Equal(2, _server.Wire.Count(w => w.EndsWith("/end")));
+        Assert.Contains("POST /capture/sequences/q1/end", _server.Wire);
+        Assert.Contains("POST /capture/sequences/q2/end", _server.Wire);
+    }
+
+    [Fact]
+    public async Task The_end_goes_to_the_account_that_got_the_start()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("1.fits"), null);
+        await Drain(u);
+        _context = _context with { Settings = S2 }; // key changed mid-sequence
+        u.SequenceFinished();
+        await Drain(u);
+        Assert.DoesNotContain(_server.Calls, c => c.Path.EndsWith("/end") && c.Auth == "Bearer " + K2);
+        _context = _context with { Settings = S1 };
+        await Drain(u);
+        Assert.Single(_server.Calls, c => c.Path.EndsWith("/end"));
+        Assert.Contains(_server.Calls, c => c.Path.EndsWith("/end") && c.Auth == "Bearer " + K1);
+        u.Dispose();
+    }
+
+    [Fact]
+    public async Task An_unfinished_sequence_ends_with_the_account_that_got_its_start()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        _context = new CaptureContext("profile-2", S2); // another profile
+        u.SequenceStarted("B"); // A never said it finished
+        u.SequenceFinished();
+        await Drain(u);
+        // profile 2 hears only of B: its start and its end
+        Assert.Equal(
+            new[] { "POST /capture/sequences/q1/start", "POST /capture/sequences/q1/end" },
+            _server.Wire);
+        _context = new CaptureContext("profile-1", S1);
+        await Drain(u);
+        // A's start and end go to profile 1, with its key
+        Assert.Equal("POST /capture/sequences/q2/end", _server.Wire[^1]);
+        Assert.Equal("Bearer " + K1, _server.Calls[^1].Auth);
+        Assert.Contains("POST /capture/sequences/q2/start", _server.Wire);
+        u.Dispose();
+    }
+
+    // --- final review before 0.1.2.0 ------------------------------------------------
+
+    [Fact]
+    public async Task A_night_queued_under_a_mistyped_key_goes_with_the_corrected_one()
+    {
+        var wrong = new ClientSettings("https://a.example/", "bnp_" + new string('x', 32));
+        _context = _context with { Settings = wrong };
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("1.fits"), null);
+        _server.Script.Enqueue(HttpStatusCode.Unauthorized);
+        await Drain(u, 3);
+        Assert.Equal(UploadProblem.KeyRejected, u.Status.Problem);
+        u.FrameSaved(Frame("2.fits"), null); // still the wrong key: waits with the others
+        u.SequenceFinished();
+        _context = _context with { Settings = S1 }; // fixed in the morning
+        await Drain(u);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/1.fits",
+                "PUT /capture/sequences/q1/frames/2.fits",
+                "POST /capture/sequences/q1/end",
+            },
+            _server.Wire);
+        Assert.All(_server.Calls.Skip(1), c => Assert.Equal("Bearer " + K1, c.Auth));
+        Assert.Equal(0, u.Status.Elsewhere);
+        u.Dispose();
+    }
+
+    [Fact]
+    public async Task A_key_that_worked_and_is_then_refused_keeps_its_own_backlog()
+    {
+        var u = Make();
+        u.FrameSaved(Frame("1.fits"), null);
+        await Drain(u);
+        u.FrameSaved(Frame("2.fits"), null);
+        _server.Script.Enqueue(HttpStatusCode.Unauthorized); // revoked: maybe another account's frames
+        await Drain(u, 2);
+        _context = _context with { Settings = S2 };
+        await Drain(u);
+        Assert.DoesNotContain(_server.Calls, c => c.Path.Contains("2.fits") && c.Auth == "Bearer " + K2);
+        Assert.Equal(1, u.Status.Elsewhere);
+        u.Dispose();
+    }
+
+    [Fact]
+    public async Task A_redirecting_address_pauses_and_loses_nothing()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("1.fits"), null);
+        u.SequenceFinished();
+        _server.Script.Enqueue(HttpStatusCode.MovedPermanently); // http:// behind a 301
+        await Drain(u, 3);
+        Assert.Equal(UploadProblem.ServerAddress, u.Status.Problem);
+        Assert.Contains("https://", StatusText.Describe(u.Status));
+        await Drain(u);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/1.fits",
+                "POST /capture/sequences/q1/end",
+            },
+            _server.Wire);
+        u.Dispose();
+    }
+
+    [Fact]
+    public void A_redirect_is_never_followed()
+    {
+        Assert.Equal(Outcome.Redirected, BortleClient.Classify(HttpStatusCode.MovedPermanently));
+        Assert.Equal(Outcome.Redirected, BortleClient.Classify(HttpStatusCode.TemporaryRedirect));
+    }
+
+    [Fact]
+    public async Task After_a_finish_mid_sequence_a_slow_first_save_keeps_the_next_frame_in_its_sequence()
+    {
+        var u = Make();
+        u.SequenceStarted("seq");
+        await u.FinishSessionAsync(TimeSpan.Zero, CancellationToken.None); // mid-sequence
+        var exposed1 = _now + TimeSpan.FromMinutes(1); // NINA carries on after the instruction
+        _now = exposed1 + TimeSpan.FromSeconds(300 + 40); // a 300 s exposure saved 40 s late
+        u.FrameSaved(Frame("1.fits"), null, exposed1);
+        u.FrameSaved(Frame("2.fits"), null, exposed1 + TimeSpan.FromSeconds(302));
+        u.SequenceFinished();
+        await Drain(u);
+        Assert.Contains("PUT /capture/sequences/q2/frames/1.fits", _server.Wire);
+        Assert.Contains("PUT /capture/sequences/q2/frames/2.fits", _server.Wire);
+        u.Dispose();
+    }
 }

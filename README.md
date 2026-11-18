@@ -33,10 +33,12 @@ N.I.N.A.
    settings page counts it. Frames saved before a profile had any key go to
    the first key that same profile gets.
 
-   Each sequence gets its own session, named by the plugin when the sequence
-   starts, and its start, frames and end carry that name. A late end, or a
-   frame N.I.N.A. writes after the end, reaches its own session, never the
-   next sequence's.
+   Each sequence gets an id when it starts; its start, frames and end carry
+   it, and an image goes to the sequence its exposure began in (N.I.N.A.'s
+   timestamp), however late it is written. Bortle files everything by that
+   id, so a late end only ends its own sequence, and a night ends when the
+   last of its sequences has ended. Needs a Bortle server from 2026-11 or
+   later.
 
    *Upload to Bortle* off stops sending as well as queuing: a backlog stays on
    disk, also across restarts, until it is switched on again. Two N.I.N.A.
@@ -49,9 +51,9 @@ N.I.N.A.
    - **Wrong key or quota full:** the plugin pauses and says so on its settings
      page.
    - **Frame the server refuses** (not a FITS file): it is skipped and logged.
-4. **The sequence ends.** The end goes through the same queue, so it reaches
-   Bortle after every frame before it. Bortle then develops all nights of each
-   target together.
+4. **The sequence ends.** The end is written to the queue at once and goes
+   out after every frame before it. Bortle waits a few minutes for images
+   N.I.N.A. is still saving, then develops all nights of each target together.
 
 ### Livestream
 

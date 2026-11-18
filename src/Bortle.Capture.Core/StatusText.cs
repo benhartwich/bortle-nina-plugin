@@ -30,8 +30,16 @@ public static class StatusText
             UploadProblem.Quota => $"Speicher des Kontos voll: {s.Message}",
             UploadProblem.Disabled => "Übertragung in diesem Profil ausgeschaltet – die Warteschlange wartet.",
             UploadProblem.Busy => "Eine andere N.I.N.A.-Instanz überträgt diese Warteschlange.",
+            UploadProblem.ServerAddress =>
+                "Serveradresse leitet um – die Adresse mit https:// eintragen. Neuer Versuch in 30 s.",
             _ => s.Message,
         };
+        if (s.Legacy > 0)
+        {
+            var legacy = $"{s.Legacy} Einträge einer älteren Plugin-Version werden nicht übertragen "
+                + "(%LOCALAPPDATA%\\NINA\\Bortle\\queue): sie wissen nicht, zu welchem Profil sie gehören";
+            detail = string.IsNullOrEmpty(detail) ? legacy : $"{detail}\n{legacy}";
+        }
         if (s.Elsewhere > 0)
         {
             // never sent with this profile's key: they wait for their own

@@ -58,6 +58,7 @@ public sealed class LiveServerTests : IDisposable
         var hello = await client.HelloAsync(CancellationToken.None);
         Assert.Equal(Outcome.Ok, hello.Outcome);
         Assert.False(string.IsNullOrEmpty(hello.Value?.Owner));
+        Assert.Equal(2, hello.Value?.Protocol); // /capture/sequences/
 
         var log = new NullLog();
         using var uploader = new Uploader(
@@ -77,6 +78,6 @@ public sealed class LiveServerTests : IDisposable
         }
         Assert.Empty(log.Errors);
         Assert.Equal(0, uploader.Status.Waiting);
-        Assert.Null(uploader.Status.SessionId); // ended
+        Assert.NotNull(uploader.Status.SessionId); // the night the server filed it in
     }
 }

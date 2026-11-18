@@ -66,13 +66,18 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NINA", "Bortle");
         // Long enough for a 120 MB frame on a slow uplink; a stalled upload is
         // retried, never waited on forever.
-        var http = new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
+        // Redirects are not followed: HttpClient would turn a POST into a GET
+        // and drop the key; the status line asks for the right address instead.
+        var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
+        {
+            Timeout = TimeSpan.FromMinutes(15),
+        };
         _client = new BortleClient(http, () => new ClientSettings(ServerUrl, PluginKey));
         // One queue per profile + server + key (QueueStore): what one account
         // queued is never sent with another's key.
         WarnAboutOldQueue(dataDir);
         _uploader = new Uploader(
-            new QueueStore(Path.Combine(dataDir, "queues")),
+            new QueueStore(Path.Combine(dataDir, "queues"), legacyQueue: Path.Combine(dataDir, "queue")),
             _client,
             () => new CaptureContext(ProfileId, new ClientSettings(ServerUrl, PluginKey), UploadEnabled),
             new NinaLog(),
@@ -233,7 +238,13 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
                 }
                 return;
             }
-            _uploader.FrameSaved(path, e.MetaData?.Target?.Name);
+            // NINA's stamp of when the exposure began decides which sequence
+            // the image belongs to, however late it is written
+            var began = e.MetaData?.Image?.ExposureStart ?? default;
+            DateTimeOffset? exposureStart = began == default
+                ? null
+                : new DateTimeOffset(began.Kind == DateTimeKind.Utc ? began : began.ToUniversalTime());
+            _uploader.FrameSaved(path, e.MetaData?.Target?.Name, exposureStart);
         }
         catch (Exception ex)
         {
@@ -263,7 +274,9 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
     {
         try
         {
-            if (UploadEnabled) _uploader.SequenceStarted(null);
+            // the session is named either way, so switching uploads on
+            // mid-sequence still ends this sequence's session
+            _uploader.SequenceStarted(null, queue: UploadEnabled);
         }
         catch (Exception ex)
         {
@@ -276,15 +289,11 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
     {
         try
         {
-            // NINA raises this right after the last instruction, while the
-            // last image is still being saved; end the session behind it.
-            if (UploadEnabled)
-            {
-                _ = _uploader.EndAfterSavesAsync(TimeSpan.FromMinutes(10), CancellationToken.None)
-                    .ContinueWith(
-                        t => Logger.Error($"Bortle: could not queue the session end: {t.Exception}"),
-                        TaskContinuationOptions.OnlyOnFaulted);
-            }
+            // Queued at once, so closing NINA now loses nothing. NINA may
+            // still be saving the last image: it carries the same sequence id
+            // (by its exposure time) and the server files it with the rest.
+            // Queued with uploads off too: it is sent only once they are on.
+            _uploader.SequenceFinished();
         }
         catch (Exception ex)
         {

@@ -9,10 +9,19 @@ namespace Bortle.Capture;
 /// <summary>Where Bortle is and the key it gave this plugin.</summary>
 public sealed record ClientSettings(string ServerUrl, string Key)
 {
+    /// <summary>
+    /// An http(s) address and a whole plugin key: "bnp_" and 32 more
+    /// characters (the server's secrets.token_urlsafe(24)). A key still being
+    /// typed is not complete, so frames taken meanwhile wait for the profile's
+    /// finished key instead of being filed under half of it.
+    /// </summary>
     public bool IsComplete =>
         Uri.TryCreate(ServerUrl?.Trim(), UriKind.Absolute, out var uri)
         && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-        && !string.IsNullOrWhiteSpace(Key);
+        && KeyShape.IsMatch(Key?.Trim() ?? "");
+
+    private static readonly System.Text.RegularExpressions.Regex KeyShape =
+        new("^bnp_[A-Za-z0-9_-]{32,}$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 }
 
 /// <summary>What to do with an answer.</summary>
@@ -30,8 +39,8 @@ public enum Outcome
     KeyMissing,
     /// <summary>The server refused the key (401/403): wrong key, revoked, or another profile's.</summary>
     KeyRejected,
-    /// <summary>The server does not know our session (any more); start a new one.</summary>
-    SessionGone,
+    /// <summary>The address answered with a redirect (http:// for https://): fix the address.</summary>
+    Redirected,
 }
 
 public sealed record ApiResult<T>(Outcome Outcome, T? Value, string? Message);
@@ -45,6 +54,7 @@ public sealed record SessionInfo
 
 public sealed record FrameResult
 {
+    [JsonPropertyName("session")] public string? Session { get; init; }
     [JsonPropertyName("stored")] public bool Stored { get; init; }
     [JsonPropertyName("duplicate")] public bool Duplicate { get; init; }
     [JsonPropertyName("project")] public string? Project { get; init; }
@@ -68,6 +78,9 @@ public sealed record Hello
     [JsonPropertyName("owner")] public string Owner { get; init; } = "";
     [JsonPropertyName("plan")] public HelloPlan? Plan { get; init; }
     [JsonPropertyName("level")] public HelloLevel? Level { get; init; }
+
+    /// <summary>2: the server takes /capture/sequences/ (plugin 0.1.2). Older servers send none.</summary>
+    [JsonPropertyName("protocol")] public int Protocol { get; init; }
 }
 
 public sealed record LivestreamShowing
@@ -128,27 +141,30 @@ public sealed class BortleClient
     public Task<ApiResult<LivestreamStatus>> StopLivestreamAsync(CancellationToken ct) =>
         SendAsync<LivestreamStatus>(HttpMethod.Post, "capture/livestream/stop", null, ct);
 
-    public Task<ApiResult<SessionInfo>> StartSessionAsync(string? sequence, CancellationToken ct) =>
+    // Every request names its sequence; the server files it by that name
+    // (services/orchestrator/capture.py, "Sequences by name"). The plugin keeps
+    // no server session ids at all.
+
+    public Task<ApiResult<SessionInfo>> StartSequenceAsync(string sequenceId, string? name, CancellationToken ct) =>
         SendAsync<SessionInfo>(
             HttpMethod.Post,
-            "capture/sessions",
-            new StringContent(JsonSerializer.Serialize(new { sequence }), Encoding.UTF8, "application/json"),
+            $"capture/sequences/{Uri.EscapeDataString(sequenceId)}/start",
+            new StringContent(JsonSerializer.Serialize(new { sequence = name }), Encoding.UTF8, "application/json"),
             ct);
 
-    public Task<ApiResult<SessionInfo>> EndSessionAsync(string sessionId, CancellationToken ct) =>
+    public Task<ApiResult<SessionInfo>> EndSequenceAsync(string sequenceId, CancellationToken ct) =>
         SendAsync<SessionInfo>(
             HttpMethod.Post,
-            $"capture/sessions/{Uri.EscapeDataString(sessionId)}/end",
+            $"capture/sequences/{Uri.EscapeDataString(sequenceId)}/end",
             null,
-            ct,
-            sessionScoped: true);
+            ct);
 
     /// <summary>
     /// Stream one frame from disk. The file is opened shared, so NINA (or a
     /// sync tool) may read it at the same time, and is never changed or deleted.
     /// </summary>
     public async Task<ApiResult<FrameResult>> PutFrameAsync(
-        string sessionId, string path, string? target, CancellationToken ct)
+        string sequenceId, string path, string? target, CancellationToken ct)
     {
         FileStream stream;
         try
@@ -157,9 +173,17 @@ public sealed class BortleClient
                 path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
                 bufferSize: 1 << 20, useAsync: true);
         }
-        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
+        catch (FileNotFoundException)
         {
             return new(Outcome.Drop, null, $"{System.IO.Path.GetFileName(path)} is gone");
+        }
+        catch (DirectoryNotFoundException e)
+        {
+            return new(Outcome.Retry, null, e.Message); // a share that dropped out
+        }
+        catch (UnauthorizedAccessException e)
+        {
+            return new(Outcome.Retry, null, e.Message);
         }
         catch (IOException e)
         {
@@ -174,15 +198,14 @@ public sealed class BortleClient
             content.Headers.ContentLength = stream.Length;
             return await SendAsync<FrameResult>(
                 HttpMethod.Put,
-                $"capture/sessions/{Uri.EscapeDataString(sessionId)}/frames/{Uri.EscapeDataString(name)}{query}",
+                $"capture/sequences/{Uri.EscapeDataString(sequenceId)}/frames/{Uri.EscapeDataString(name)}{query}",
                 content,
-                ct,
-                sessionScoped: true).ConfigureAwait(false);
+                ct).ConfigureAwait(false);
         }
     }
 
     private async Task<ApiResult<T>> SendAsync<T>(
-        HttpMethod method, string path, HttpContent? content, CancellationToken ct, bool sessionScoped = false)
+        HttpMethod method, string path, HttpContent? content, CancellationToken ct)
     {
         var settings = _settings();
         if (!settings.IsComplete)
@@ -198,10 +221,13 @@ public sealed class BortleClient
                 .SendAsync(request, HttpCompletionOption.ResponseContentRead, ct)
                 .ConfigureAwait(false);
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            var outcome = Classify(response.StatusCode, sessionScoped);
+            var outcome = Classify(response.StatusCode);
             if (outcome != Outcome.Ok)
             {
-                return new(outcome, default, $"HTTP {(int)response.StatusCode}: {Detail(body)}");
+                var detail = response.StatusCode == HttpStatusCode.NotFound
+                    ? "the server does not know this request (a Bortle older than 2026-11, or a proxy rule): "
+                    : "";
+                return new(outcome, default, $"HTTP {(int)response.StatusCode}: {detail}{Detail(body)}");
             }
             try
             {
@@ -223,13 +249,20 @@ public sealed class BortleClient
         }
     }
 
-    internal static Outcome Classify(HttpStatusCode status, bool sessionScoped)
+    /// <summary>
+    /// What an answer means. A 404 is never "start something new": with
+    /// sequences named by the plugin there is nothing to replace, so it is a
+    /// route the server or a proxy does not have, retried with backoff.
+    /// </summary>
+    internal static Outcome Classify(HttpStatusCode status)
     {
         var code = (int)status;
         if (code is >= 200 and < 300) return Outcome.Ok;
+        // A redirect is never followed: a POST would arrive as a GET, without the key.
+        if (code is >= 300 and < 400) return Outcome.Redirected;
         if (status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return Outcome.KeyRejected;
         if (status == HttpStatusCode.RequestEntityTooLarge) return Outcome.Pause; // quota
-        if (status == HttpStatusCode.NotFound) return sessionScoped ? Outcome.SessionGone : Outcome.Retry;
+        if (status == HttpStatusCode.NotFound) return Outcome.Retry;
         if (status is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests) return Outcome.Retry;
         if (code is >= 400 and < 500) return Outcome.Drop;
         return Outcome.Retry;
