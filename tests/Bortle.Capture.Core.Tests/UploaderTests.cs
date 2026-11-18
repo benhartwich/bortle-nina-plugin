@@ -586,6 +586,30 @@ public sealed class UploaderTests : IDisposable
             _server.Wire);
     }
 
+    private static void DeleteWhatCanBeDeleted(string dir)
+    {
+        foreach (var file in Directory.GetFiles(dir, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                File.Delete(file);
+            }
+            catch (IOException)
+            {
+            }
+        }
+        foreach (var sub in Directory.GetDirectories(dir, "*", SearchOption.AllDirectories).OrderByDescending(d => d.Length))
+        {
+            try
+            {
+                Directory.Delete(sub);
+            }
+            catch (IOException)
+            {
+            }
+        }
+    }
+
     [Fact]
     public async Task A_deleted_queue_folder_neither_kills_the_loop_nor_loses_later_frames()
     {
@@ -595,7 +619,8 @@ public sealed class UploaderTests : IDisposable
         try
         {
             await Task.Delay(200);
-            Directory.Delete(Path.Combine(_dir, "queues"), true);
+            // as by hand: on Windows the files a running NINA holds open stay
+            DeleteWhatCanBeDeleted(Path.Combine(_dir, "queues"));
             u.Wake();
             await Task.Delay(200);
             var loop = (Task?)typeof(Uploader).GetField("_loop", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(u);
