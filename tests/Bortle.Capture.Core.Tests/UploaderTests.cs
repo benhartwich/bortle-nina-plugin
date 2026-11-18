@@ -788,4 +788,88 @@ public sealed class UploaderTests : IDisposable
     [InlineData(HttpStatusCode.InternalServerError, Outcome.Retry)]
     public void Answers_are_classified(HttpStatusCode status, Outcome expected) =>
         Assert.Equal(expected, BortleClient.Classify(status));
+
+    // --- review round 5 ---------------------------------------------------------------
+
+    [Fact]
+    public async Task A_second_NINA_never_ends_the_sequence_the_first_is_running()
+    {
+        var a = Make();
+        a.SequenceStarted("A");
+        a.FrameSaved(Frame("1.fits"), null);
+        using (var b = Make()) // a second NINA starts on the same machine
+        {
+            await Drain(a);
+            Assert.DoesNotContain(_server.Wire, w => w.EndsWith("/end"));
+        }
+        a.FrameSaved(Frame("2.fits"), null);
+        a.SequenceFinished();
+        await Drain(a);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/1.fits",
+                "PUT /capture/sequences/q1/frames/2.fits",
+                "POST /capture/sequences/q1/end",
+            },
+            _server.Wire);
+        a.Dispose();
+    }
+
+    [Fact]
+    public async Task Two_NINAs_each_end_their_own_sequence_after_a_crash()
+    {
+        var a = Make();
+        a.SequenceStarted("A");
+        var b = Make();
+        b.SequenceStarted("B");
+        a.Dispose(); // both crash
+        b.Dispose();
+        using var again = Make();
+        await Drain(again);
+        Assert.Equal(2, _server.Wire.Count(w => w.EndsWith("/end")));
+        Assert.Contains("POST /capture/sequences/q1/end", _server.Wire);
+        Assert.Contains("POST /capture/sequences/q2/end", _server.Wire);
+    }
+
+    [Fact]
+    public async Task The_end_goes_to_the_account_that_got_the_start()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("1.fits"), null);
+        await Drain(u);
+        _context = _context with { Settings = S2 }; // key changed mid-sequence
+        u.SequenceFinished();
+        await Drain(u);
+        Assert.DoesNotContain(_server.Calls, c => c.Path.EndsWith("/end") && c.Auth == "Bearer " + K2);
+        _context = _context with { Settings = S1 };
+        await Drain(u);
+        Assert.Single(_server.Calls, c => c.Path.EndsWith("/end"));
+        Assert.Contains(_server.Calls, c => c.Path.EndsWith("/end") && c.Auth == "Bearer " + K1);
+        u.Dispose();
+    }
+
+    [Fact]
+    public async Task An_unfinished_sequence_ends_with_the_account_that_got_its_start()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        _context = new CaptureContext("profile-2", S2); // another profile
+        u.SequenceStarted("B"); // A never said it finished
+        u.SequenceFinished();
+        await Drain(u);
+        // profile 2 hears only of B: its start and its end
+        Assert.Equal(
+            new[] { "POST /capture/sequences/q1/start", "POST /capture/sequences/q1/end" },
+            _server.Wire);
+        _context = new CaptureContext("profile-1", S1);
+        await Drain(u);
+        // A's start and end go to profile 1, with its key
+        Assert.Equal("POST /capture/sequences/q2/end", _server.Wire[^1]);
+        Assert.Equal("Bearer " + K1, _server.Calls[^1].Auth);
+        Assert.Contains("POST /capture/sequences/q2/start", _server.Wire);
+        u.Dispose();
+    }
 }

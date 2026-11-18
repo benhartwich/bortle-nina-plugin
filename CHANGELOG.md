@@ -3,7 +3,7 @@
 ## 0.1.2.0
 
 Rebuilt after the N.I.N.A. plugin manifest review (isbeorn/nina.plugin.manifests#795)
-and three adversarial review rounds of our own. **Needs a Bortle server from
+and five adversarial review rounds of our own. **Needs a Bortle server from
 2026-11 or later** (`/capture/hello` answers `"protocol": 2`); an older server
 answers 404, which the plugin retries with backoff and names in its status line.
 
@@ -28,7 +28,10 @@ answers 404, which the plugin retries with backoff and names in its status line.
   Switching it on mid-sequence still ends that sequence.
 - **The end is on disk at once**: closing N.I.N.A. right after a sequence
   loses nothing. A sequence that never said it finished (N.I.N.A. started the
-  next one, or crashed) is ended by the next start or the next run.
+  next one, or crashed) is ended by the next start or the next run — the run
+  of that same N.I.N.A.: a second instance on the PC never ends a sequence the
+  first is still running. An end always goes to the account that got the
+  sequence's start, even when the profile or key changed in between.
   "Finish Bortle session" placed mid-sequence ends Bortle's sequence; frames
   N.I.N.A. takes after it form a sequence of their own.
 - **Robust against the PC**: entries keep their order when the clock is

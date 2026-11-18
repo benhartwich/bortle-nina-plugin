@@ -117,7 +117,7 @@ public sealed class Uploader : IDisposable
 
     // The sequences of this run, newest last: when each started and ended.
     // A frame goes to the sequence its exposure began in.
-    private readonly List<(string Id, DateTimeOffset Start, DateTimeOffset? End)> _history = new();
+    private readonly List<(string Id, DateTimeOffset Start, DateTimeOffset? End, string Queue)> _history = new();
     private (string Id, DateTimeOffset LastUsed)? _adhoc;
 
     // NINA's own sequence is still running (its SequenceFinished not seen yet),
@@ -156,10 +156,9 @@ public sealed class Uploader : IDisposable
     {
         try
         {
-            if (_store.Running is { } orphan)
+            foreach (var orphan in _store.TakeOrphans())
             {
                 _store.ByName(orphan.Queue).Enqueue(EntryKind.SessionEnd, _clock(), orphan.Id);
-                _store.Running = null;
             }
         }
         catch (Exception e)
@@ -247,35 +246,22 @@ public sealed class Uploader : IDisposable
     /// </summary>
     public void SequenceStarted(string? sequence, bool queue = true)
     {
-        string? unfinished = null;
-        lock (_sequences)
-        {
-            // a sequence that never said it finished ends where the next begins
-            if (_history.Count > 0 && _history[^1].End is null)
-            {
-                _history[^1] = _history[^1] with { End = _clock() };
-                unfinished = _history[^1].Id;
-            }
-            _ninaRunning = true;
-        }
-        if (unfinished is not null)
-        {
-            Enqueue(EntryKind.SessionEnd, unfinished);
-        }
+        lock (_sequences) _ninaRunning = true;
+        // a sequence that never said it finished ends where the next begins
+        if (TakeCurrent() is { } unfinished) EndSequence(unfinished);
         Begin(sequence, queue);
     }
 
     /// <summary>A new sequence id: remembered (also on disk) and its start queued.</summary>
     private string Begin(string? sequence, bool queue)
     {
-        string session;
+        var session = NewSession();
+        var target = _store.For(_context());
         lock (_sequences)
         {
-            session = NewSession();
-            _history.Add((session, _clock(), null));
+            _history.Add((session, _clock(), null, target.Name));
             if (_history.Count > 20) _history.RemoveAt(0);
         }
-        var target = _store.For(_context());
         _store.Running = (session, target.Name);
         if (queue)
         {
@@ -309,7 +295,7 @@ public sealed class Uploader : IDisposable
     public (FrameQueue Queue, QueueEntry Entry) SequenceFinished()
     {
         lock (_sequences) _ninaRunning = false; // NINA's own finish
-        return Enqueue(EntryKind.SessionEnd, TakeCurrent());
+        return EndSequence(TakeCurrent());
     }
 
     /// <summary>
@@ -323,7 +309,7 @@ public sealed class Uploader : IDisposable
     {
         var deadline = _clock() + timeout;
         // the instruction ends Bortle's sequence; NINA's may still go on
-        var (queue, end) = Enqueue(EntryKind.SessionEnd, TakeCurrent());
+        var (queue, end) = EndSequence(TakeCurrent());
         var settled = await WaitForSavesAsync(deadline, ct).ConfigureAwait(false);
         while (end.Session is { } session ? queue.HasSession(session) : queue.Contains(end))
         {
@@ -357,6 +343,24 @@ public sealed class Uploader : IDisposable
         return (queue, queue.Enqueue(kind, _clock(), session, path, target, sequence));
     }
 
+    /// <summary>
+    /// Queue the end of a sequence where its start went: the account that
+    /// opened it on the server, even when the profile or key changed since.
+    /// </summary>
+    private (FrameQueue, QueueEntry) EndSequence(string? session)
+    {
+        string? name = null;
+        lock (_sequences)
+        {
+            foreach (var h in _history)
+            {
+                if (h.Id == session) name = h.Queue;
+            }
+        }
+        var queue = name is null ? _store.For(_context()) : _store.ByName(name);
+        return (queue, queue.Enqueue(EntryKind.SessionEnd, _clock(), session));
+    }
+
     /// <summary>End the running sequence and return its id (null: nothing running).</summary>
     private string? TakeCurrent()
     {
@@ -385,13 +389,13 @@ public sealed class Uploader : IDisposable
                 // the newest sequence that was running when the exposure began
                 for (var i = _history.Count - 1; i >= 0; i--)
                 {
-                    var (id, start, end) = _history[i];
+                    var (id, start, end, _) = _history[i];
                     if (start - Skew <= t && (end is null || t <= end + Skew)) return id;
                 }
             }
             else if (_history.Count > 0)
             {
-                var (id, _, end) = _history[^1];
+                var (id, _, end, _) = _history[^1];
                 if (end is null || (now - end <= LateFrameWindow && !_ninaRunning)) return id;
             }
             if (_ninaRunning && _history.Count > 0 && _history[^1].End is not null)

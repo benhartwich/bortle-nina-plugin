@@ -326,6 +326,8 @@ public sealed class QueueStore : IDisposable
     private readonly string? _legacy;
     private readonly Dictionary<string, FrameQueue> _queues = new();
     private readonly object _lock = new();
+    private (string Id, string Queue)? _running;
+    private FileStream? _runningMarker;
 
     public event Action? Changed;
 
@@ -368,40 +370,97 @@ public sealed class QueueStore : IDisposable
             : throw new ArgumentException($"not a queue name: {name}");
 
     /// <summary>
-    /// The sequence NINA is running, kept on disk: if NINA stops without
+    /// The sequence this NINA is running, kept on disk: if NINA stops without
     /// saying the sequence finished, the next start of the plugin ends it.
+    /// Each process has a marker of its own, held open while it runs, so a
+    /// second NINA on the machine never takes the first one's sequence for
+    /// an orphan (review round 5).
     /// </summary>
     public (string Id, string Queue)? Running
     {
         get
         {
-            try
-            {
-                var file = System.IO.Path.Combine(_root, "running.txt");
-                if (!File.Exists(file)) return null;
-                var parts = File.ReadAllText(file).Trim().Split(' ');
-                return parts.Length == 2 ? (parts[0], parts[1]) : null;
-            }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                return null;
-            }
+            lock (_lock) return _running;
         }
         set
         {
-            try
+            lock (_lock)
             {
-                var file = System.IO.Path.Combine(_root, "running.txt");
-                Directory.CreateDirectory(_root);
-                if (value is { } v) File.WriteAllText(file, $"{v.Id} {v.Queue}");
-                else File.Delete(file);
-            }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                // best effort: at worst the server's idle sweep ends that night
+                _running = value;
+                try
+                {
+                    if (value is { } v)
+                    {
+                        if (_runningMarker is null)
+                        {
+                            Directory.CreateDirectory(RunningDir);
+                            _runningMarker = new FileStream(
+                                System.IO.Path.Combine(RunningDir, Guid.NewGuid().ToString("N") + ".txt"),
+                                FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.None);
+                        }
+                        var bytes = System.Text.Encoding.UTF8.GetBytes($"{v.Id} {v.Queue}");
+                        _runningMarker.SetLength(0);
+                        _runningMarker.Write(bytes, 0, bytes.Length);
+                        _runningMarker.Flush(true);
+                    }
+                    else if (_runningMarker is { } marker)
+                    {
+                        _runningMarker = null;
+                        var file = marker.Name;
+                        marker.Dispose();
+                        File.Delete(file);
+                    }
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    // best effort: at worst the server's idle sweep ends that night
+                }
             }
         }
     }
+
+    /// <summary>
+    /// The sequences of runs that stopped without saying they finished: the
+    /// markers no live process holds. Each is returned once, and removed.
+    /// </summary>
+    public List<(string Id, string Queue)> TakeOrphans()
+    {
+        var found = new List<(string Id, string Queue)>();
+        string[] files;
+        try
+        {
+            if (!Directory.Exists(RunningDir)) return found;
+            files = Directory.GetFiles(RunningDir, "*.txt");
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return found;
+        }
+        foreach (var file in files)
+        {
+            lock (_lock)
+            {
+                if (_runningMarker is not null && file == _runningMarker.Name) continue;
+            }
+            try
+            {
+                // opens only when the NINA that wrote it is gone; deleted on close,
+                // so two plugins starting together cannot both take it
+                using var stream = new FileStream(
+                    file, FileMode.Open, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.DeleteOnClose);
+                using var reader = new StreamReader(stream);
+                var parts = reader.ReadToEnd().Trim().Split(' ');
+                if (parts.Length == 2) found.Add((parts[0], parts[1]));
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                // held by a NINA that is still running
+            }
+        }
+        return found;
+    }
+
+    private string RunningDir => System.IO.Path.Combine(_root, "running");
 
     public FrameQueue Destination(string profileId, ClientSettings settings) =>
         For("d-" + Hash(profileId, Normalize(settings.ServerUrl), settings.Key.Trim()));
@@ -445,6 +504,9 @@ public sealed class QueueStore : IDisposable
         {
             foreach (var queue in _queues.Values) queue.Dispose();
             _queues.Clear();
+            // the marker stays on disk: the next run ends that sequence
+            _runningMarker?.Dispose();
+            _runningMarker = null;
         }
     }
 
