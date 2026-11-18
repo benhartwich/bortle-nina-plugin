@@ -872,4 +872,100 @@ public sealed class UploaderTests : IDisposable
         Assert.Contains("POST /capture/sequences/q2/start", _server.Wire);
         u.Dispose();
     }
+
+    // --- final review before 0.1.2.0 ------------------------------------------------
+
+    [Fact]
+    public async Task A_night_queued_under_a_mistyped_key_goes_with_the_corrected_one()
+    {
+        var wrong = new ClientSettings("https://a.example/", "bnp_" + new string('x', 32));
+        _context = _context with { Settings = wrong };
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("1.fits"), null);
+        _server.Script.Enqueue(HttpStatusCode.Unauthorized);
+        await Drain(u, 3);
+        Assert.Equal(UploadProblem.KeyRejected, u.Status.Problem);
+        u.FrameSaved(Frame("2.fits"), null); // still the wrong key: waits with the others
+        u.SequenceFinished();
+        _context = _context with { Settings = S1 }; // fixed in the morning
+        await Drain(u);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/1.fits",
+                "PUT /capture/sequences/q1/frames/2.fits",
+                "POST /capture/sequences/q1/end",
+            },
+            _server.Wire);
+        Assert.All(_server.Calls.Skip(1), c => Assert.Equal("Bearer " + K1, c.Auth));
+        Assert.Equal(0, u.Status.Elsewhere);
+        u.Dispose();
+    }
+
+    [Fact]
+    public async Task A_key_that_worked_and_is_then_refused_keeps_its_own_backlog()
+    {
+        var u = Make();
+        u.FrameSaved(Frame("1.fits"), null);
+        await Drain(u);
+        u.FrameSaved(Frame("2.fits"), null);
+        _server.Script.Enqueue(HttpStatusCode.Unauthorized); // revoked: maybe another account's frames
+        await Drain(u, 2);
+        _context = _context with { Settings = S2 };
+        await Drain(u);
+        Assert.DoesNotContain(_server.Calls, c => c.Path.Contains("2.fits") && c.Auth == "Bearer " + K2);
+        Assert.Equal(1, u.Status.Elsewhere);
+        u.Dispose();
+    }
+
+    [Fact]
+    public async Task A_redirecting_address_pauses_and_loses_nothing()
+    {
+        var u = Make();
+        u.SequenceStarted("A");
+        u.FrameSaved(Frame("1.fits"), null);
+        u.SequenceFinished();
+        _server.Script.Enqueue(HttpStatusCode.MovedPermanently); // http:// behind a 301
+        await Drain(u, 3);
+        Assert.Equal(UploadProblem.ServerAddress, u.Status.Problem);
+        Assert.Contains("https://", StatusText.Describe(u.Status));
+        await Drain(u);
+        Assert.Equal(
+            new[]
+            {
+                "POST /capture/sequences/q1/start",
+                "POST /capture/sequences/q1/start",
+                "PUT /capture/sequences/q1/frames/1.fits",
+                "POST /capture/sequences/q1/end",
+            },
+            _server.Wire);
+        u.Dispose();
+    }
+
+    [Fact]
+    public void A_redirect_is_never_followed()
+    {
+        Assert.Equal(Outcome.Redirected, BortleClient.Classify(HttpStatusCode.MovedPermanently));
+        Assert.Equal(Outcome.Redirected, BortleClient.Classify(HttpStatusCode.TemporaryRedirect));
+    }
+
+    [Fact]
+    public async Task After_a_finish_mid_sequence_a_slow_first_save_keeps_the_next_frame_in_its_sequence()
+    {
+        var u = Make();
+        u.SequenceStarted("seq");
+        await u.FinishSessionAsync(TimeSpan.Zero, CancellationToken.None); // mid-sequence
+        var exposed1 = _now + TimeSpan.FromMinutes(1); // NINA carries on after the instruction
+        _now = exposed1 + TimeSpan.FromSeconds(300 + 40); // a 300 s exposure saved 40 s late
+        u.FrameSaved(Frame("1.fits"), null, exposed1);
+        u.FrameSaved(Frame("2.fits"), null, exposed1 + TimeSpan.FromSeconds(302));
+        u.SequenceFinished();
+        await Drain(u);
+        Assert.Contains("PUT /capture/sequences/q2/frames/1.fits", _server.Wire);
+        Assert.Contains("PUT /capture/sequences/q2/frames/2.fits", _server.Wire);
+        u.Dispose();
+    }
 }

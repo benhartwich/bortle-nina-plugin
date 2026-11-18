@@ -118,6 +118,80 @@ public sealed class FrameQueue : IDisposable
         }
     }
 
+    /// <summary>The server has taken something sent with this queue's key and address.</summary>
+    public bool Accepted => File.Exists(System.IO.Path.Combine(Root, "accepted"));
+
+    /// <summary>
+    /// Where entries of this queue go instead, after its key or address was
+    /// refused before it ever worked: the profile's pending queue (its name),
+    /// or null.
+    /// </summary>
+    public string? RejectedInto
+    {
+        get
+        {
+            try
+            {
+                var file = System.IO.Path.Combine(Root, "rejected");
+                return File.Exists(file) ? File.ReadAllText(file).Trim() : null;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                return null;
+            }
+        }
+    }
+
+    /// <summary>The key and address work: noted once, and any rejection undone.</summary>
+    public void MarkAccepted()
+    {
+        try
+        {
+            Directory.CreateDirectory(Root);
+            var file = System.IO.Path.Combine(Root, "accepted");
+            if (!File.Exists(file)) File.WriteAllText(file, DateTimeOffset.UtcNow.ToString("o"));
+            File.Delete(System.IO.Path.Combine(Root, "rejected"));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// A key or address that never worked: hand every entry to the profile's
+    /// pending queue, which goes with whatever key the profile has next, and
+    /// send new ones there too. Entries keep their ids, so the order stays.
+    /// </summary>
+    public int RejectInto(FrameQueue pending)
+    {
+        var moved = 0;
+        lock (_lock)
+        {
+            try
+            {
+                File.WriteAllText(System.IO.Path.Combine(Root, "rejected"), pending.Name);
+                Directory.CreateDirectory(pending._dir);
+                foreach (var file in Files().ToList())
+                {
+                    try
+                    {
+                        File.Move(file, System.IO.Path.Combine(pending._dir, System.IO.Path.GetFileName(file)));
+                        moved++;
+                    }
+                    catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                    {
+                        // locked for a moment: the next refusal moves it
+                    }
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+        // no wake: nothing new to send, and the refused key waits its pause
+        return moved;
+    }
+
     /// <summary>Entries set aside as damaged.</summary>
     public int DamagedCount => Directory.Exists(_dir) ? Directory.EnumerateFiles(_dir, "*.bad").Count() : 0;
 
@@ -364,10 +438,15 @@ public sealed class QueueStore : IDisposable
     public FrameQueue Pending(string profileId) => For("p-" + Hash(profileId));
 
     /// <summary>A queue by its folder name (what <see cref="FrameQueue.Name"/> gave).</summary>
-    public FrameQueue ByName(string name) =>
-        System.Text.RegularExpressions.Regex.IsMatch(name, "^[pd]-[0-9a-f]{20}$")
-            ? For(name)
-            : throw new ArgumentException($"not a queue name: {name}");
+    public FrameQueue ByName(string name)
+    {
+        if (!System.Text.RegularExpressions.Regex.IsMatch(name, "^[pd]-[0-9a-f]{20}$"))
+        {
+            throw new ArgumentException($"not a queue name: {name}");
+        }
+        var queue = For(name);
+        return queue.RejectedInto is { } into && into != name && into.StartsWith("p-") ? ByName(into) : queue;
+    }
 
     /// <summary>
     /// The sequence this NINA is running, kept on disk: if NINA stops without
@@ -466,10 +545,13 @@ public sealed class QueueStore : IDisposable
         For("d-" + Hash(profileId, Normalize(settings.ServerUrl), settings.Key.Trim()));
 
     /// <summary>The queue new entries of this context go to.</summary>
-    public FrameQueue For(CaptureContext context) =>
-        context.Settings.IsComplete
-            ? Destination(context.ProfileId, context.Settings)
-            : Pending(context.ProfileId);
+    public FrameQueue For(CaptureContext context)
+    {
+        if (!context.Settings.IsComplete) return Pending(context.ProfileId);
+        var destination = Destination(context.ProfileId, context.Settings);
+        // a key or address that was refused before it ever worked owns nothing
+        return destination.RejectedInto is null ? destination : Pending(context.ProfileId);
+    }
 
     /// <summary>Everything waiting in any queue but these.</summary>
     public int CountExcept(params FrameQueue?[] these)

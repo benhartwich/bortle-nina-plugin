@@ -39,6 +39,8 @@ public enum Outcome
     KeyMissing,
     /// <summary>The server refused the key (401/403): wrong key, revoked, or another profile's.</summary>
     KeyRejected,
+    /// <summary>The address answered with a redirect (http:// for https://): fix the address.</summary>
+    Redirected,
 }
 
 public sealed record ApiResult<T>(Outcome Outcome, T? Value, string? Message);
@@ -256,6 +258,8 @@ public sealed class BortleClient
     {
         var code = (int)status;
         if (code is >= 200 and < 300) return Outcome.Ok;
+        // A redirect is never followed: a POST would arrive as a GET, without the key.
+        if (code is >= 300 and < 400) return Outcome.Redirected;
         if (status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return Outcome.KeyRejected;
         if (status == HttpStatusCode.RequestEntityTooLarge) return Outcome.Pause; // quota
         if (status == HttpStatusCode.NotFound) return Outcome.Retry;

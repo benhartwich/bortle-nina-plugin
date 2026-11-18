@@ -66,7 +66,12 @@ public sealed class BortlePlugin : PluginBase, INotifyPropertyChanged
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NINA", "Bortle");
         // Long enough for a 120 MB frame on a slow uplink; a stalled upload is
         // retried, never waited on forever.
-        var http = new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
+        // Redirects are not followed: HttpClient would turn a POST into a GET
+        // and drop the key; the status line asks for the right address instead.
+        var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
+        {
+            Timeout = TimeSpan.FromMinutes(15),
+        };
         _client = new BortleClient(http, () => new ClientSettings(ServerUrl, PluginKey));
         // One queue per profile + server + key (QueueStore): what one account
         // queued is never sent with another's key.

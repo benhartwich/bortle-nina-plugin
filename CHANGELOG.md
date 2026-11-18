@@ -22,6 +22,13 @@ answers 404, which the plugin retries with backoff and names in its status line.
   that key. Frames saved before a profile had any key go with the key that
   same profile has when they are sent. A key is only a key when it is whole
   (`bnp_` + 32 characters), so frames saved while one is being typed wait.
+  A key or address the server refused before it ever worked (a typo, a
+  revoked key pasted by mistake) owns nothing: what was queued with it goes
+  with the key the profile gets next. A key that worked keeps its backlog.
+- **A redirecting address is named, not followed.** `http://` for a server
+  that redirects to `https://` used to turn starts and ends into GETs without
+  the key, which were then dropped; the status line now asks for the address
+  with `https://`, and nothing leaves the queue.
 - **Two N.I.N.A. instances** never overwrite each other's entries; one sends a
   given queue at a time, and a N.I.N.A. that cannot send holds no lock.
 - **"Upload to Bortle" off stops the backlog too**, also after a restart.

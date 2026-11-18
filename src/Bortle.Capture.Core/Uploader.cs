@@ -31,6 +31,8 @@ public enum UploadProblem
     Disabled,
     /// <summary>Another N.I.N.A. instance is sending this queue.</summary>
     Busy,
+    /// <summary>The server address redirects (e.g. http:// to https://).</summary>
+    ServerAddress,
 }
 
 public sealed record UploaderStatus(
@@ -248,18 +250,25 @@ public sealed class Uploader : IDisposable
     {
         lock (_sequences) _ninaRunning = true;
         // a sequence that never said it finished ends where the next begins
-        if (TakeCurrent() is { } unfinished) EndSequence(unfinished);
+        if (TakeCurrent() is { } unfinished)
+        {
+            EndSequence(unfinished);
+            Forget(unfinished);
+        }
         Begin(sequence, queue);
     }
 
     /// <summary>A new sequence id: remembered (also on disk) and its start queued.</summary>
-    private string Begin(string? sequence, bool queue)
+    private string Begin(string? sequence, bool queue, DateTimeOffset? exposed = null)
     {
         var session = NewSession();
         var target = _store.For(_context());
+        // begun no later than the exposure that opened it: saving that frame
+        // may have taken longer than the skew
+        var start = exposed is { } t && t < _clock() ? t : _clock();
         lock (_sequences)
         {
-            _history.Add((session, _clock(), null, target.Name));
+            _history.Add((session, start, null, target.Name));
             if (_history.Count > 20) _history.RemoveAt(0);
         }
         _store.Running = (session, target.Name);
@@ -282,7 +291,7 @@ public sealed class Uploader : IDisposable
         {
             // "Finish Bortle session" stood mid-sequence and NINA carries on:
             // what follows is a sequence of its own, ended by NINA's finish
-            session = Begin(null, queue: true);
+            session = Begin(null, queue: true, exposed: exposureStart);
         }
         Enqueue(EntryKind.Frame, session, path, target);
     }
@@ -295,7 +304,10 @@ public sealed class Uploader : IDisposable
     public (FrameQueue Queue, QueueEntry Entry) SequenceFinished()
     {
         lock (_sequences) _ninaRunning = false; // NINA's own finish
-        return EndSequence(TakeCurrent());
+        var id = TakeCurrent();
+        var ended = EndSequence(id);
+        Forget(id);
+        return ended;
     }
 
     /// <summary>
@@ -309,7 +321,9 @@ public sealed class Uploader : IDisposable
     {
         var deadline = _clock() + timeout;
         // the instruction ends Bortle's sequence; NINA's may still go on
-        var (queue, end) = EndSequence(TakeCurrent());
+        var current = TakeCurrent();
+        var (queue, end) = EndSequence(current);
+        Forget(current);
         var settled = await WaitForSavesAsync(deadline, ct).ConfigureAwait(false);
         while (end.Session is { } session ? queue.HasSession(session) : queue.Contains(end))
         {
@@ -371,11 +385,16 @@ public sealed class Uploader : IDisposable
             _history[^1] = _history[^1] with { End = _clock() };
             id = _history[^1].Id;
         }
-        if (_store.Running is { } running && running.Id == id)
+        return id;
+    }
+
+    /// <summary>The marker goes only after the end is on disk: a crash in between ends it twice, never not at all.</summary>
+    private void Forget(string? id)
+    {
+        if (id is not null && _store.Running is { } running && running.Id == id)
         {
             _store.Running = null;
         }
-        return id;
     }
 
     /// <summary>The sequence of a frame; null when NINA carries on after "Finish Bortle session".</summary>
@@ -583,6 +602,7 @@ public sealed class Uploader : IDisposable
         {
             case Outcome.Ok:
                 queue.Remove(entry);
+                if (!destination.Accepted) destination.MarkAccepted();
                 _retry = FirstRetry;
                 _status = _status with { LastSent = _clock() };
                 Publish(UploaderState.Sending, null);
@@ -596,7 +616,12 @@ public sealed class Uploader : IDisposable
                 Publish(UploaderState.Paused, message, UploadProblem.KeyMissing);
                 return KeyPause;
             case Outcome.KeyRejected:
+                StrandNothing(destination, pending);
                 Publish(UploaderState.Paused, message, UploadProblem.KeyRejected);
+                return KeyPause;
+            case Outcome.Redirected:
+                StrandNothing(destination, pending);
+                Publish(UploaderState.Paused, message, UploadProblem.ServerAddress);
                 return KeyPause;
             case Outcome.Pause:
                 Publish(UploaderState.Paused, message, UploadProblem.Quota);
@@ -605,6 +630,19 @@ public sealed class Uploader : IDisposable
                 Publish(UploaderState.Retrying, message);
                 return Backoff();
         }
+    }
+
+    /// <summary>
+    /// A key mistyped, or an address that is not the server's (http:// for
+    /// https://), never worked for anyone: what was queued with it goes with
+    /// the key and address the profile gets next, instead of waiting for
+    /// settings that will never be right (final review before 0.1.2.0).
+    /// </summary>
+    private void StrandNothing(FrameQueue destination, FrameQueue pending)
+    {
+        if (destination.Accepted) return; // it worked before: a revoked key keeps its own
+        var moved = destination.RejectInto(pending);
+        if (moved > 0) _log.Info($"Bortle: {moved} entries wait for a working key or address");
     }
 
     private TimeSpan Backoff()
