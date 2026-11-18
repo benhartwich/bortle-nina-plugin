@@ -25,3 +25,16 @@ jobs:
         with:
           name: bortle-nina-plugin
           path: dist/*.zip
+
+  windows:
+    # File locks (FileShare.None, DeleteOnClose) behave differently on
+    # Windows, where N.I.N.A. runs: the core tests run there too.
+    name: Test on Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "8.0.x"
+      - name: dotnet test (core)
+        run: dotnet test tests/Bortle.Capture.Core.Tests --filter "Category!=E2E"
